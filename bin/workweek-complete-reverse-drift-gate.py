@@ -1,0 +1,63 @@
+# Unix shebang — was generator-owned by gen-launcher-shim.py --ensure-unix; that mode was retired 2026-07-28 (POSIX-EXEC-ASSUMPTION-GUARD, PM ruling) and no longer regenerates this line.
+"""workweek-complete-reverse-drift-gate.py — CLI trampoline over claude-klabauter
+coordinator_core.ops.workweek_reverse_drift_gate.
+
+/workweek-complete Step 4g blocking merge gate for copy_install plugin
+mirrors: discovers each registered `reverse_drift_cmd` (delegated to
+list-reverse-drift-cmds' already-ported registry read), runs it from its
+plugin's source_path, and folds the discovery reader's 3-way rc plus every
+per-command pass/fail into one exit code.
+
+CLI: [--scope-repo <repo-root>]   (default: `git rev-parse --show-toplevel`,
+                                    falling back to cwd)
+
+Exit codes: propagates coordinator_core.ops.workweek_reverse_drift_gate.main's
+own 0/1 business contract verbatim (see that module's docstring for the full
+rc semantics, incl. the COORDINATOR_OVERRIDE_REVERSE_DRIFT=1 escape hatch). A
+missing/unresolvable engine root (this trampoline's OWN transport failure,
+distinct from the ported module's business exit code) exits 1 — a fail-loud
+gate feeder must never let a claude-klabauter-link outage silently pass a merge gate.
+
+Port source: coordinator/commands/workweek-complete.md § Step 4g (coordinator-content-repo),
+the per-plugin execution loop with 3-way rc branching.
+Port backlink: docs/plans/2026-07-15-bash-to-naked-python-engine-migration.md
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+def _prepare_claude_klabauter_root() -> None:
+    import lib  # noqa: F401 — bootstraps coordinator/bin/lib onto sys.path
+    from cc_invoke import require_dispatch_engine_on_path
+
+    claude_klabauter_root = require_dispatch_engine_on_path()
+
+
+def main(argv: "list[str] | None" = None) -> int:
+    try:
+        _prepare_claude_klabauter_root()
+    except RuntimeError as exc:
+        print(
+            f"workweek-complete-reverse-drift-gate: engine-root resolution failed: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    from coordinator_core.cli_entry import run_op_main
+
+    try:
+        code = run_op_main("coordinator_core.ops.workweek_reverse_drift_gate", (sys.argv[1:] if argv is None else argv))
+    except ImportError as exc:
+        print(
+            "workweek-complete-reverse-drift-gate: "
+            f"coordinator_core.ops.workweek_reverse_drift_gate not importable: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

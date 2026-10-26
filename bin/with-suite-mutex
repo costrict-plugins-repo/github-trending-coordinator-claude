@@ -1,0 +1,737 @@
+#!/usr/bin/env python3
+"""with-suite-mutex — repo-agnostic acquiring wrapper for the machine-wide
+test-suite mutex (coordinator_core.testing.suite_mutex, DR-088 layer 6).
+
+WHY THIS EXISTS: the mutex's READ side (the bash_guards deny check) has
+always worked, but its TAKE side was wired into exactly two callers in this
+repo — coordinator_core/testing/full_runner.py and
+coordinator/bin/validate-fast-and-packageability.py. Every other way a
+suite actually gets run (a bare pytest, pnpm run tier:fast, a
+consumer-repo's own runner script) took nothing, so holder() was
+effectively always None and layer 6 never fired for those paths. This
+wrapper closes that gap by being a generic acquire-run-release shell around
+an ARBITRARY command, so any repo/runner can opt in with the same one-liner
+regardless of whether it speaks pytest, pnpm, or a bespoke script.
+
+USAGE
+    with-suite-mutex [--owner-label LABEL] [--collection NAME] [--max-runtime SECS] [--reuse-fresh] -- <command> [args...]
+    with-suite-mutex --wait [--wait-timeout SECS]
+
+REUSE MODE: --reuse-fresh (a wrapper flag, before -- only) first reads
+the current suite-run record of --collection. A fresh record for the
+same command is reused with no spawn: stderr gets suite-run: reused ... and
+the exit code is the record's. Otherwise the tier-U gate runs on the command as
+typed (exit 77 on refusal), a held mutex is refused (exit 75, the --wait
+advice), and the command runs once under a zero-timeout acquire (a lost race
+terminates the unrun child, exit 75); a recorded run prints suite-run: ran ....
+
+    with-suite-mutex -- pnpm run tier:fast
+    with-suite-mutex -- python3 -m pytest -m 'not cadence'
+    with-suite-mutex --owner-label workday-complete -- python3 bin/run-full-test-suite.py --yes
+
+WAIT MODE: --wait blocks until the mutex has no holder, then exits 0; it
+runs no command and takes nothing. It is the wait the guard's refusal names:
+the bash_guards deny a suite-shaped command (wrapped or not) while another run
+holds the mutex, so the wrapped form can never reach its own blocking acquire
+at that moment, and a raw pid-liveness poll on the holder is denied by its own
+guard. --wait is not suite-shaped, so it passes both. Exit 1 after
+--wait-timeout SECS (default suite_mutex.MUTEX_WAIT_SECS) with the
+holder still named. Freedom is a snapshot, not a reservation: another run can
+take the mutex between this exit and the retry, which is then refused again.
+
+Without --wait, a literal -- followed by at least one token is REQUIRED — mirrors
+coordinator/bin/scoped-git-commit's own hard requirement for a -- and a
+non-empty operand, and its refusal to offer an unscoped form. There is no
+"everything after the flags is the command" fallback: an accidentally-eaten
+flag-looking child argument must never silently swallow into this wrapper's
+own flag parsing.
+
+PID SEMANTICS (load-bearing — see suite_mutex's module docstring,
+"PID-LIVENESS"): this wrapper is a short-lived acquirer that does not itself
+run the suite — it spawns a child process and waits on it. The module
+docstring is explicit that such a caller MUST pass pid= explicitly,
+because the PID recorded in the lock's metadata is the sole liveness signal;
+recording this wrapper's own os.getpid() would make the lock look dead
+the instant the child inherits the terminal and this process's stack frame
+returns from acquire() — in the worst case immediately if the OS reuses
+the wrapper's PID for something else before the child exits. The lock is
+therefore acquired with pid=child.pid, taken from the subprocess.Popen
+handle after spawn.
+
+EXIT CODE is the child's, verbatim — this wrapper never coerces a suite
+failure into a wrapper success or vice versa. The ONE exception is the
+--max-runtime ceiling, which kills the child and returns 124: there is no
+child exit code to report in that case, because the child never produced one.
+
+RELEASE ON EVERY EXIT PATH: normal completion, non-zero child exit, an
+exception before/after spawn, and Ctrl-C/SIGINT. Achieved by running the
+child inside suite_mutex.held(...)'s own context manager rather than a
+hand-rolled acquire/release pair — its finally releases whenever
+acquire() actually won, matching the module's own contract.
+
+SPAWN-THEN-ACQUIRE ORDERING (the actual PID chicken/egg): acquire()
+needs the child's PID at acquisition time (see PID SEMANTICS above), but the
+child's PID does not exist until after it is spawned — and spawning it
+unconditionally before acquiring would let two concurrent wrapper
+invocations both start real work before either wins the mutex, defeating
+serialization entirely. This wrapper resolves the ordering by spawning the
+child, then suspending it (via psutil.Process.suspend(), the same
+cross-platform primitive suite_mutex's own liveness check already
+depends on for pid_alive), acquiring the mutex with the now-known child
+PID, and only then resuming it.
+
+KNOWN GAP — suspend is NOT atomic with spawn: Popen() and .suspend()
+are two separate syscalls, so a child that runs to completion inside that
+window (before this process reaches .suspend()) executes fully
+unserialized against a concurrent invocation; suspend() then raises
+NoSuchProcess, swallowed below, and the mutex is still acquired against
+the correct (already-exited) child PID, so no lock-metadata corruption
+results — only the serialization guarantee is weakened for such fast
+children. Closing this fully would mean CREATE_SUSPENDED on Windows or a
+POSIX self-SIGSTOP preexec_fn, both platform-specific spawn-flag
+changes; deliberately not done here — see review escalation, and the
+CREATE_NO_WINDOW negative-spec above for why touching spawn flags on this
+line is treated as a tradeoff, not a silent fix.
+
+WAIT POSTURE: copies full_runner.py's and
+validate-fast-and-packageability.py's posture and message shape exactly
+— wait up to suite_mutex.MUTEX_WAIT_SECS, and on timeout print the
+current holder and PROCEED UNSERIALIZED with a warning, rather than
+refusing. This is a resource control, not an authorization gate; refusing to
+run at all here would turn a serialization aid into a spurious failure.
+
+Negative-spec — what this wrapper is NOT:
+    - NOT runner-aware. It knows nothing about pytest, pnpm, node, or any
+      other test tool — it execs whatever argv follows -- unmodified.
+      Do not add runner-specific flag parsing here.
+    - NOT a retry loop or an output filter. It DOES capture: the child's
+      stdout/stderr are pipes that two threads forward, byte for byte and
+      unmodified, to this process's matching streams while appending them to
+      one log, which becomes current.log of the two-slot suite-run record
+      (coordinator_core.testing.suite_run_record) for --collection.
+      Capture never alters, drops or reorders a forwarded byte.
+    - NOT a substitute for the runner's own per-test timeout. --max-runtime
+      is a ceiling on the WHOLE command and fires only when a run has stopped
+      making progress entirely; a slow or hanging individual test is the
+      runner's job (--timeout for pytest) and should be bounded there,
+      where the failure can still name the test.
+    - NOT an authorization check — it takes the same mutex the
+      bash_guards deny-side already reads; it does not replace or
+      duplicate tier/grant enforcement. The one exception is --reuse-fresh,
+      whose miss path runs enforce_tier_u_gate itself because the Bash guard
+      defers such a segment to this wrapper.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import shlex
+import time
+from typing import List, Optional, Tuple
+
+
+def _wants_help(argv: List[str]) -> bool:
+    """True for `--help`/`-h` among this wrapper's own flags. Tokens after `--`
+    belong to the child: `with-suite-mutex -- pytest -h` runs pytest's help."""
+    flags = argv[: argv.index("--")] if "--" in argv else argv
+    return "--help" in flags or "-h" in flags
+
+
+# Answered before psutil and the engine bootstrap: the percolate entrypoint
+# gate runs `--help` with no machine-local registry, where
+# `require_engine_on_path` raises. Help text must not depend on either.
+if __name__ == "__main__" and _wants_help(sys.argv[1:]):
+    print(__doc__.strip())
+    sys.exit(0)
+
+import psutil  # noqa: E402
+
+_LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
+if _LIB_DIR not in sys.path:
+    sys.path.insert(0, _LIB_DIR)
+
+from cc_invoke import require_colocated_engine_on_path  # noqa: E402
+
+# The engine root must be on sys.path before the coordinator_core import
+# below: this file is also published into the claude-klabauter mirror, where
+# coordinator_core is NOT pip-installed and the interpreter's sys.path[0] is
+# this bin/ directory, not the checkout root (and this CLI is deliberately
+# repo-agnostic — resolved off this file's own location, never off cwd or
+# the calling repo). Same bootstrap as coordinator/bin/coordinator-lesson-add
+# (9b979ee5f).
+#
+# COLOCATED, never the env-first `require_engine_on_path`: what this imports is
+# the engine's OWN test helper, so the right copy is the one belonging to the
+# checkout this file lives in. See with-tier-t-slot's note at the same seam for
+# what env-first did to a run whose COORDINATOR_ENGINE_ROOT named a mirror
+# pinned behind the checkout.
+require_colocated_engine_on_path(__file__)
+
+from coordinator_core.session.tier_u_gate import enforce_tier_u_gate  # noqa: E402
+from coordinator_core.testing import (  # noqa: E402
+    suite_mutex,
+    suite_run_record,
+    suite_run_reuse,
+)
+from coordinator_core.win_portability import no_console_creationflags  # noqa: E402
+
+_DEFAULT_OWNER_PREFIX = "with-suite-mutex"
+_DEFAULT_COLLECTION = "default"
+
+#: Exit codes of the --reuse-fresh refusals: 77 = tier-U gate refused, 75 = mutex held.
+_GATE_REFUSED_EXIT_CODE = 77
+_MUTEX_HELD_EXIT_CODE = 75
+
+#: Wall-clock ceiling on a single wrapped command, in seconds. 0 disables it.
+#:
+#: Anchored to ``suite_mutex.STALE_TTL_SECS`` rather than to a number invented
+#: here: that constant is already the module's own answer to "past this age a
+#: holder is not live", so a child outliving it is, by the mutex's own
+#: definition, no longer a holder worth waiting for. Raising one without the
+#: other would let this wrapper defend a lock the lock itself has given up on.
+#:
+#: WHY THIS EXISTS AT ALL, and why no pytest flag replaces it (measured
+#: 2026-08-25 on the fast tier): `--timeout` and `--session-timeout` are both
+#: enforced from inside `pytest_runtest_protocol`, i.e. only while a test is
+#: RUNNING. When an xdist worker dies uninterruptibly (`node down: Not properly
+#: terminated`), the controller blocks in `dsession.loop_once` -> `queue.get()`
+#: and every surviving worker sits idle in `execnet ... serve()`. No test is
+#: running anywhere, so neither timeout can ever fire and the run hangs forever
+#: -- while holding this fleet-wide mutex, which blocks every peer's suite.
+#: Only a bound OUTSIDE pytest closes that, which is what this is.
+_DEFAULT_MAX_RUNTIME_SECS = suite_mutex.STALE_TTL_SECS
+
+#: Seconds between holder() reads in ``--wait`` mode. holder() is one stat plus
+#: at most one small read, and also reclaims a dead holder's lock.
+_WAIT_POLL_SECS = 1.0
+
+#: Exit code for a run killed by the ceiling. 124 is GNU ``timeout``'s, chosen
+#: so an existing caller that already special-cases a timeout keeps working.
+_MAX_RUNTIME_EXIT_CODE = 124
+
+
+def _install_signal_handlers() -> None:
+    """Route SIGTERM/SIGBREAK through the same KeyboardInterrupt cleanup path
+    as Ctrl-C, so a lock acquired by this wrapper is released on every
+    interrupt style a caller (or a fleet-wide process reaper) might send —
+    not only a literal Ctrl-C, whose default handler already raises
+    ``KeyboardInterrupt``. Best-effort: a signal absent on this platform (no
+    ``SIGBREAK`` off Windows) or one the runtime refuses to rebind is a
+    silent no-op, never a startup failure.
+    """
+
+    def _handler(signum, frame):  # noqa: ANN001 - stdlib signal handler shape
+        raise KeyboardInterrupt()
+
+    for name in ("SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            pass
+
+
+_ParsedArgs = Tuple[Optional[str], Optional[str], float, List[str], bool]
+_BAD_ARGS: _ParsedArgs = (None, None, 0.0, [], False)
+
+_USAGE = (
+    "Usage: with-suite-mutex [--owner-label LABEL] [--collection NAME] [--max-runtime SECS] "
+    "[--reuse-fresh] -- <command> [args...]"
+)
+
+
+def _parse_args(argv: List[str]) -> _ParsedArgs:
+    """Parse ``argv`` into ``(owner_label, collection, max_runtime_secs, command, reuse_fresh)``.
+
+    ``collection`` is None unless ``--collection NAME`` was given (a slug).
+    ``--reuse-fresh`` is a wrapper flag only: after ``--`` it belongs to the child.
+
+    Returns ``(None, None, 0.0, [], False)`` (with an error already printed) on a malformed
+    invocation — no ``--``, or a ``--`` with nothing after it. Every flag
+    MUST appear before the ``--`` separator; nothing after it is
+    interpreted, matching ``scoped-git-commit``'s own hard split.
+
+    ``--max-runtime SECS`` overrides ``_DEFAULT_MAX_RUNTIME_SECS``; ``0``
+    disables the ceiling for a caller that genuinely needs an unbounded run.
+    This is NOT runner-specific flag parsing (see the negative-spec above) —
+    it is a bound on the wrapped child whatever that child is.
+    """
+    if "--" not in argv:
+        print(
+            "with-suite-mutex: missing required `--` separator before the command.\n"
+            + _USAGE,
+            file=sys.stderr,
+        )
+        return _BAD_ARGS
+
+    sep_index = argv.index("--")
+    flags = argv[:sep_index]
+    command = argv[sep_index + 1 :]
+
+    if not command:
+        print(
+            "with-suite-mutex: `--` must be followed by at least one command token.\n"
+            + _USAGE,
+            file=sys.stderr,
+        )
+        return _BAD_ARGS
+
+    owner_label: Optional[str] = None
+    collection: Optional[str] = None
+    max_runtime: float = _DEFAULT_MAX_RUNTIME_SECS
+    reuse_fresh = False
+
+    def _parse_collection(raw: str) -> Optional[str]:
+        if not suite_run_record.COLLECTION_RE.match(raw):
+            print(
+                f"with-suite-mutex: --collection must match [a-z0-9][a-z0-9._-]*, got {raw!r}.",
+                file=sys.stderr,
+            )
+            return None
+        return raw
+
+    def _parse_max_runtime(raw: str) -> Optional[float]:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            print(
+                f"with-suite-mutex: --max-runtime needs a number of seconds, got {raw!r}.",
+                file=sys.stderr,
+            )
+            return None
+        if value < 0:
+            print("with-suite-mutex: --max-runtime cannot be negative.", file=sys.stderr)
+            return None
+        return value
+
+    i = 0
+    while i < len(flags):
+        flag = flags[i]
+        if flag == "--reuse-fresh":
+            reuse_fresh = True
+            i += 1
+            continue
+        if flag == "--owner-label":
+            if i + 1 >= len(flags):
+                print("with-suite-mutex: --owner-label requires a value.", file=sys.stderr)
+                return _BAD_ARGS
+            owner_label = flags[i + 1]
+            i += 2
+            continue
+        if flag.startswith("--owner-label="):
+            owner_label = flag.split("=", 1)[1]
+            i += 1
+            continue
+        if flag == "--collection" or flag.startswith("--collection="):
+            if flag == "--collection":
+                if i + 1 >= len(flags):
+                    print("with-suite-mutex: --collection requires a value.", file=sys.stderr)
+                    return _BAD_ARGS
+                raw, i = flags[i + 1], i + 2
+            else:
+                raw, i = flag.split("=", 1)[1], i + 1
+            collection = _parse_collection(raw)
+            if collection is None:
+                return _BAD_ARGS
+            continue
+        if flag == "--max-runtime":
+            if i + 1 >= len(flags):
+                print("with-suite-mutex: --max-runtime requires a value.", file=sys.stderr)
+                return _BAD_ARGS
+            parsed = _parse_max_runtime(flags[i + 1])
+            if parsed is None:
+                return _BAD_ARGS
+            max_runtime = parsed
+            i += 2
+            continue
+        if flag.startswith("--max-runtime="):
+            parsed = _parse_max_runtime(flag.split("=", 1)[1])
+            if parsed is None:
+                return _BAD_ARGS
+            max_runtime = parsed
+            i += 1
+            continue
+        print(f"with-suite-mutex: unrecognized flag {flag!r}.", file=sys.stderr)
+        return _BAD_ARGS
+
+    return owner_label, collection, max_runtime, command, reuse_fresh
+
+
+def _parse_wait_args(argv: List[str]) -> Optional[float]:
+    """Return the ``--wait`` timeout in seconds, or ``None`` when ``argv`` is
+    not a wait-mode invocation (no ``--wait`` flag among the wrapper's own
+    flags). Raises ``ValueError`` with a printable message on a malformed one.
+
+    Wait mode runs no command, so it rejects a ``--`` and any flag other than
+    ``--wait-timeout``: ``--owner-label``/``--max-runtime`` describe a wrapped
+    child that does not exist here.
+    """
+    if "--wait" not in argv:
+        return None
+    timeout = suite_mutex.MUTEX_WAIT_SECS
+    i = 0
+    while i < len(argv):
+        flag = argv[i]
+        if flag == "--wait":
+            i += 1
+            continue
+        if flag == "--wait-timeout" or flag.startswith("--wait-timeout="):
+            if flag == "--wait-timeout":
+                if i + 1 >= len(argv):
+                    raise ValueError("--wait-timeout requires a value.")
+                raw, i = argv[i + 1], i + 2
+            else:
+                raw, i = flag.split("=", 1)[1], i + 1
+            try:
+                timeout = float(raw)
+            except ValueError:
+                raise ValueError(
+                    f"--wait-timeout needs a number of seconds, got {raw!r}."
+                ) from None
+            if timeout < 0:
+                raise ValueError("--wait-timeout cannot be negative.")
+            continue
+        raise ValueError(
+            f"--wait takes no command and only --wait-timeout SECS, got {flag!r}."
+        )
+    return timeout
+
+
+def _slug(text: str) -> str:
+    """``text`` lowered and reduced to a ``COLLECTION_RE`` slug; empty when nothing survives."""
+    return re.sub(r"[^a-z0-9._-]+", "-", text.lower()).strip("-._")
+
+
+def _default_collection(owner_label: Optional[str], command: List[str]) -> str:
+    """Suite name when ``--collection`` is absent: the owner label, else the command's
+    leading tokens up to the first flag (at most three), as a slug.
+    Commands that differ only after a flag (``python -m pytest a`` vs ``... b``) share a name;
+    pass ``--collection`` or ``--owner-label`` to separate them.
+    Falls back to ``_DEFAULT_COLLECTION`` when no slug survives."""
+    name = _slug(owner_label or "")
+    if not name:
+        words = []
+        for token in command[:3]:
+            if token.startswith("-"):
+                break
+            base = os.path.basename(token)
+            words.append(base[:-4] if base.lower().endswith(".exe") else base)
+        name = _slug("-".join(words))[:40].strip("-._")
+    return name if name and suite_run_record.COLLECTION_RE.match(name) else _DEFAULT_COLLECTION
+
+
+def _wait_for_free(timeout: float) -> int:
+    """Block until ``suite_mutex.holder()`` is None; 0 when free, 1 on timeout."""
+    deadline = time.monotonic() + timeout
+    while True:
+        current = suite_mutex.holder()
+        if current is None:
+            return 0
+        if time.monotonic() >= deadline:
+            print(
+                "with-suite-mutex: still held after %gs by pid %s | owner %s | "
+                "started %s | %s"
+                % (
+                    timeout, current.get("pid", "?"), current.get("owner", "?"),
+                    current.get("started_at", "?"), current.get("cmd", "?"),
+                ),
+                file=sys.stderr,
+            )
+            return 1
+        time.sleep(min(_WAIT_POLL_SECS, max(0.0, deadline - time.monotonic())))
+
+
+def _kill_process_tree(process: "subprocess.Popen[bytes]") -> int:
+    """Terminate ``process`` AND its descendants; return how many were killed.
+
+    Killing only the direct child is not enough for any runner that spawns
+    its own workers. pytest-xdist is the case this was written against: the
+    controller is the direct child, but the worker processes are ITS
+    children, and they do not exit when it dies -- they sit in
+    ``execnet ... serve()`` waiting for a controller that is gone, holding
+    real memory on a box with dozens of concurrent sessions. Observed
+    2026-08-25: killing the controller by hand left six orphaned workers
+    that each had to be killed individually.
+
+    Best-effort by construction: a process that exits between enumeration
+    and signalling raises ``NoSuchProcess``, which is the outcome we wanted
+    anyway, and one we cannot signal raises ``AccessDenied``. Neither is
+    worth failing the kill path over, so both are swallowed per-process.
+    """
+    try:
+        parent = psutil.Process(process.pid)
+        victims = parent.children(recursive=True) + [parent]
+    except psutil.Error:
+        victims = []
+
+    for victim in victims:
+        try:
+            victim.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    _gone, alive = psutil.wait_procs(victims, timeout=10)
+    for victim in alive:
+        try:
+            victim.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    psutil.wait_procs(alive, timeout=5)
+
+    if process.poll() is None:
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    return len(victims)
+
+
+def _wait_interruptible(
+    process: "subprocess.Popen[bytes]", max_runtime: float = 0.0
+) -> int:
+    """Wait for ``process`` to exit while staying responsive to signals.
+
+    ``Popen.wait()`` with no timeout blocks inside a single uninterruptible
+    OS wait call on Windows (``WaitForSingleObject`` with an infinite
+    timeout) — a signal delivered mid-wait (Ctrl-C, Ctrl-Break, SIGTERM) is
+    not observed by the Python interpreter until that call returns, which
+    defeats this wrapper's release-on-interrupt contract. Polling with a
+    short timeout instead gives the interpreter a periodic chance to notice
+    a pending signal and raise, on every platform.
+
+    ``max_runtime`` (seconds; ``0`` disables) is a wall-clock ceiling on the
+    child. On expiry the child's whole process tree is killed and
+    ``_MAX_RUNTIME_EXIT_CODE`` is returned, so the surrounding
+    ``suite_mutex.held(...)`` unwinds normally and RELEASES the lock. That
+    release is the point: the failure this bounds is a child that stops
+    making progress while still holding a machine-wide mutex, which converts
+    one session's wedge into every peer's.
+    """
+    deadline = (time.monotonic() + max_runtime) if max_runtime > 0 else None
+    while True:
+        try:
+            return process.wait(timeout=0.25)
+        except subprocess.TimeoutExpired:
+            if deadline is not None and time.monotonic() >= deadline:
+                killed = _kill_process_tree(process)
+                print(
+                    "with-suite-mutex: killed the command after "
+                    f"{int(max_runtime)}s ({killed} process(es)) and released the "
+                    "suite mutex. The ceiling cannot tell a wedged run from a long "
+                    "serial one; output above is unbuffered. Bound workers via "
+                    "coordinator-resolve-validation-cmd --full, or if wedged: "
+                    "py-spy dump --pid <controller-pid>. "
+                    "Raise or disable this ceiling with --max-runtime SECS (0 = unbounded).",
+                    file=sys.stderr,
+                )
+                return _MAX_RUNTIME_EXIT_CODE
+            continue
+
+
+def main(argv: List[str]) -> int:
+    _install_signal_handlers()
+    try:
+        wait_timeout = _parse_wait_args(argv[: argv.index("--")] if "--" in argv else argv)
+    except ValueError as exc:
+        print(f"with-suite-mutex: {exc}", file=sys.stderr)
+        return 2
+    if wait_timeout is not None:
+        if "--" in argv:
+            print("with-suite-mutex: --wait takes no `-- <command>`.", file=sys.stderr)
+            return 2
+        return _wait_for_free(wait_timeout)
+    owner_label, collection, max_runtime, command, reuse_fresh = _parse_args(argv)
+    if not command:
+        return 2
+    argv_as_given = list(command)
+    if collection is None:
+        collection = _default_collection(owner_label, argv_as_given)
+
+    prefix = owner_label if owner_label else _DEFAULT_OWNER_PREFIX
+    owner = suite_mutex.mutex_owner(prefix)
+    cmd_str = " ".join(command)
+
+    # The child's stdout/stderr are pipes this wrapper forwards live (see _Tee), so
+    # CREATE_NO_WINDOW is safe: its hidden console is harmless once both streams
+    # are explicit pipes. Passing the flag with real fds instead would collide
+    # with the pipe kwargs.
+    # CreateProcess does no PATHEXT resolution, so a bare `pnpm`/`npm`/`yarn`/
+    # `npx` -- all of which ship on Windows as `.cmd` shims -- raises
+    # WinError 2 here while resolving fine from a shell. shutil.which honours
+    # PATHEXT and returns the shim's real path. Resolution is deliberately
+    # fail-open: which() returning None leaves `command` untouched so a
+    # genuinely-absent binary still surfaces Popen's own FileNotFoundError
+    # naming it, rather than a substituted error from this lookup. shell=True
+    # is NOT the fix -- it would re-parse the already-split argv and mangle any
+    # argument containing a space or quote.
+    resolved = shutil.which(command[0])
+    if resolved is not None:
+        command = [resolved, *command[1:]]
+
+    repo_root = suite_run_record.repo_root_for(os.getcwd())
+    if repo_root is None:
+        print("with-suite-mutex: not inside a git repo; no suite-run record.", file=sys.stderr)
+    if reuse_fresh:
+        reuse = (
+            suite_run_reuse.find_reusable(repo_root, collection, argv_as_given)
+            if repo_root is not None else None
+        )
+        if reuse is not None:
+            print(suite_run_reuse.reused_line(reuse), file=sys.stderr)
+            return reuse.exit_code
+        gate = enforce_tier_u_gate(
+            shlex.join(argv_as_given),
+            repo_root=str(repo_root) if repo_root is not None else None,
+        )
+        if not gate.proceed:
+            print(gate.refusal_message, file=sys.stderr)
+            return _GATE_REFUSED_EXIT_CODE
+        if suite_mutex.holder() is not None:
+            print(
+                "with-suite-mutex: another suite run holds the mutex; run "
+                "`with-suite-mutex --wait`, then retry.",
+                file=sys.stderr,
+            )
+            return _MUTEX_HELD_EXIT_CODE
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **no_console_creationflags(),
+    )
+    try:
+        ps_process = psutil.Process(process.pid)
+    except psutil.Error:
+        # Review: coordinator:code-reviewer -- Popen() succeeded but the
+        # child was already gone/transitioning by the time we looked it up
+        # (extremely fast exit). Reap it like every other exit path does,
+        # rather than propagating with no cleanup at all.
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        raise
+
+    def _resume_then_escalate() -> None:
+        """Resume-then-escalate cleanup for a child that may still be
+        SUSPENDED when we're forced off the happy path.
+
+        Review: coordinator:code-reviewer -- a process stopped via
+        ``psutil.Process.suspend()`` (SIGSTOP on POSIX) does not act on a
+        pending SIGTERM until it is resumed or killed outright; resuming
+        first is required or ``terminate()`` below is silently held pending
+        forever, leaving a suspended orphan for the lock's 45-minute stale
+        TTL.
+        """
+        try:
+            ps_process.resume()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+    try:
+        ps_process.suspend()
+    except psutil.NoSuchProcess:
+        # Exited (or never truly scheduled) before we could suspend it --
+        # nothing left to serialize against; fall through and let
+        # process.wait() report its real exit code below.
+        pass
+    except psutil.AccessDenied:
+        # Cannot suspend on this platform/process -- degrade to "spawned
+        # already running" rather than failing the whole invocation; the
+        # mutex is still acquired against the correct (child) PID.
+        pass
+
+    try:
+        with suite_mutex.held(
+            owner, cmd_str,
+            timeout=0.0 if reuse_fresh else suite_mutex.MUTEX_WAIT_SECS,
+            pid=process.pid,
+        ) as acquired:
+            if not acquired and reuse_fresh:
+                # SIGKILL reaches a stopped child; SIGTERM would stay pending on it.
+                process.kill()
+                process.wait()
+                print(
+                    "with-suite-mutex: another suite run took the mutex first; run "
+                    "`with-suite-mutex --wait`, then retry.",
+                    file=sys.stderr,
+                )
+                return _MUTEX_HELD_EXIT_CODE
+            if not acquired:
+                current = suite_mutex.holder() or {}
+                print(
+                    "[WARN] suite mutex held by %s for %ss — proceeding unserialized"
+                    % (current.get("owner", "<unknown>"), int(suite_mutex.MUTEX_WAIT_SECS)),
+                    file=sys.stderr,
+                )
+            started_at = suite_run_reuse._now_iso()
+            started_mono = time.monotonic()
+            head_sha, dirty_paths = (None, [])
+            log_path: Optional[str] = None
+            if repo_root is not None:
+                head_sha, dirty_paths, log_path = suite_run_reuse.begin_run(
+                    repo_root, collection
+                )
+            try:
+                ps_process.resume()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+            tee = suite_run_reuse.Tee(process, log_path)
+            exit_code, outcome = 130, "interrupted"
+            try:
+                exit_code = _wait_interruptible(process, max_runtime)
+                outcome = (
+                    "pass" if exit_code == 0
+                    else "timeout" if exit_code == _MAX_RUNTIME_EXIT_CODE
+                    else "fail"
+                )
+                return exit_code
+            except BaseException:
+                _resume_then_escalate()
+                raise
+            finally:
+                complete = tee.finish()
+                if repo_root is not None and log_path is not None:
+                    suite_run_reuse.record_run(
+                        str(repo_root), collection, command, head_sha, dirty_paths,
+                        started_at, started_mono, exit_code, outcome, bool(acquired),
+                        log_path, not complete,
+                    )
+                    if reuse_fresh:
+                        print(
+                            suite_run_reuse.ran_line(
+                                collection, head_sha, outcome,
+                                suite_run_record.record_dir(repo_root, collection)
+                                / "current.log",
+                            ),
+                            file=sys.stderr,
+                        )
+    except BaseException:
+        # Review: coordinator:code-reviewer -- covers KeyboardInterrupt AND
+        # every other exception (lock-file I/O error, corrupt meta.json,
+        # a non-NoSuchProcess/AccessDenied raise out of resume() above,
+        # etc). The previous bare `finally` only `terminate()`d without
+        # resuming first, which left a SIGSTOP'd child permanently unable
+        # to observe that SIGTERM -- an unreaped, suspended orphan.
+        _resume_then_escalate()
+        raise
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,42 @@
+{
+  "schema": "review-roster-fragment",
+  "schema_version": 6,
+  "blocking_verdicts": {
+    "coordinator:code-reviewer": "BLOCKED",
+    "coordinator:overengineering-reviewer": "REJECTED",
+    "coordinator:staff-eng": "REJECTED",
+    "coordinator:staff-data-sci": "REJECTED",
+    "coordinator:senior-front-end": "REJECTED",
+    "coordinator:staff-ux": "REJECTED"
+  },
+  "execute_review": {
+    "required_for_emit": ["plan", "inventory", "queue", "wave-fire-dispatch"],
+    "brightline": { "op": "review_brightline_gate", "partition_on": "PARTITION-MANDATORY" },
+    "stages": [
+      {
+        "kind": "prep",
+        "agents": [
+          { "agentType": "coordinator:test-runner", "model": "haiku", "effort": "low", "schema": "review-prep-result" }
+        ]
+      },
+      {
+        "kind": "review-wave",
+        "agents": [
+          { "agentType": "coordinator:code-reviewer", "model": "sonnet", "effort": "low", "per": "slice", "executor_rows_per_reviewer": { "min": 3, "max": 6 }, "applies": "own-slice", "schema": "slice-review-result" }
+        ]
+      },
+      {
+        "kind": "integration",
+        "agents": [
+          { "agentType": "coordinator:overengineering-reviewer", "model": "opus", "effort": "low", "per": "whole-diff", "min_tshirt": "L", "applies": "whole-diff", "schema": "whole-diff-review-result" }
+        ]
+      },
+      {
+        "kind": "judge",
+        "agents": [
+          { "agentType": "coordinator:exit-criterion-judge", "model": "sonnet", "effort": "low", "schema": "terminal-judge-result" }
+        ]
+      }
+    ]
+  }
+}

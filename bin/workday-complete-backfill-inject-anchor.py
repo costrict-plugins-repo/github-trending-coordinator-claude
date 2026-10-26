@@ -1,0 +1,422 @@
+"""workday-complete-backfill-inject-anchor.py — Phase A0 mechanical anchor injection.
+
+Injects covered_tip_sha/covered_machine anchors into a pre-existing daily summary that
+lacks them. Called before any Phase A analyst fan-out so format-migration gap rows are
+closed deterministically without dispatching agents.
+
+Usage: workday-complete-backfill-inject-anchor.py <ROOT> <DATE> <DESCENDANT_TIP_SHA> [TODAY] [MACHINE]
+  ROOT               — repo root (path; must be a git worktree)
+  DATE               — date in YYYY-MM-DD format
+  DESCENDANT_TIP_SHA — the per-day descendant tip SHA (caller resolves from scan row;
+                       this script verifies it resolves via git rev-parse)
+  TODAY              — optional override for "today" (YYYY-MM-DD); defaults to today (local)
+  MACHINE            — optional machine name (caller knows from scan row; skips branch-ref enumeration)
+
+Exit codes:
+  0  — anchor injected (also covers a STALE anchor bumped to the descendant tip)
+  10 — already anchored (idempotent skip; anchor present AND fresh/newer)
+  20 — summary file absent (real content gap → caller routes to Phase A analyst)
+  30 — content-completeness or commit-density guard fired (no anchor injected)
+  1  — usage / bad DATE / bad ROOT / unresolvable SHA / malformed summary structure
+
+Anchor format injected (bare line-start — scan greps '^covered_tip_sha:'):
+  covered_tip_sha: <full-40-char-sha>
+  covered_machine: <machine>
+  > _Record anchor injected <TODAY> by /workday-complete backfill (mechanical) — summary content pre-existing._
+
+Spec backlink: docs/plans/2026-07-02-backfill-anchor-injection-contract.md § Deliverable A
+Negative-spec: anchors are bare line-start, NOT blockquoted ('> covered_tip_sha:') — the
+  backfill scan greps '^covered_tip_sha:'; a blockquote prefix silently breaks the match.
+
+Port of: workday-complete-backfill-inject-anchor.sh (DoE 091c0f3e, 2026-07-19).
+The one incidental `python3 -c` JSON-length parse (with grep fallback) is now native json.
+Coordinator_claude_klabauter_root's bash-lib bridge call (workday_ceremony_lib.lib_func) is RETIRED
+(de-bash campaign, docs/2026-07-29-debash-residual-sites-spec.md § Group C) — `_completion_count()`
+now resolves the engine root via `cc_invoke.ensure_engine_on_path()` (the same self-location-first
+resolver `_derive_machine()` below already uses) and queries the completion-log directly in-process
+via `coordinator_core.ops.ceremony.records_query.query_records`, dropping the `command -v node`
+gate outright rather than porting it: query-completions.py (what the gate used to guard) is
+itself already fully native and spawns no node subprocess (see
+coordinator_core/ops/query_completions.py's own "Node-subprocess retirement" note), so the gate
+could only ever produce a false negative. This also fixes a genuine pre-existing bug the old
+bridge call carried (coordinator/tests/test_workday_complete_backfill_inject_anchor.py's
+`test_case4_content_gap_guard` xfail): the old call queried the engine root's own archive/completed/
+instead of the target repo's — the native call below queries `root` (this function's own
+parameter), not claude_klabauter_root. cs_compute_machine is natively imported from
+coordinator_core.machine_resolver (de-bash campaign, unit "daily-branch" — Port of:
+coordinator-daily-branch.sh, DoE 2fbe0e77, 2026-07-19).
+"""
+from __future__ import annotations
+
+import datetime
+import glob
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+_BOOTSTRAP_DONE = False
+
+
+def _bootstrap_engine() -> None:
+    global _BOOTSTRAP_DONE
+    if _BOOTSTRAP_DONE:
+        return
+    lib_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib")
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    _BOOTSTRAP_DONE = True
+
+
+MUTATES = ["archive/daily-summaries/*.md"]
+
+_ANCHOR_KEY = "covered_tip_sha:"
+_MACHINE_KEY = "covered_machine:"
+
+
+def _err(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def _ensure_claude_klabauter_on_path() -> None:
+    import cc_invoke
+
+    cc_invoke.ensure_engine_on_path(__file__)
+
+
+def _declare_write(target_file: str) -> None:
+    try:
+        _ensure_claude_klabauter_on_path()
+        from coordinator_core.session.declared_writes import declare_write
+
+        declare_write(target_file)
+    except (RuntimeError, ImportError):
+        pass
+
+
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_NULL_TOKENS = {"", "null", "none", "~"}
+
+
+def _anchor_write_refusal(full_sha: str, machine: str) -> str:
+    """Return a one-line refusal reason when the anchor is not writable, else ''."""
+    if not _FULL_SHA_RE.match(full_sha or ""):
+        return f"REFUSED: covered_tip_sha must be 40 hex (got {full_sha!r}); anchor not written"
+    if not (machine or "").strip():
+        return "REFUSED: covered_machine must be non-empty; anchor not written"
+    return ""
+
+
+def _read_anchor_values(target_file: str) -> tuple[str, str]:
+    """Return (recorded sha token, recorded machine token); '' when absent or null."""
+    sha = machine = ""
+    seen_sha = seen_machine = False
+    with open(target_file, "r", encoding="utf-8") as f:
+        for line in f:
+            if not seen_sha and line.startswith(_ANCHOR_KEY):
+                seen_sha = True
+                parts = line.split()
+                sha = parts[1] if len(parts) >= 2 else ""
+            elif not seen_machine and line.startswith(_MACHINE_KEY):
+                seen_machine = True
+                parts = line.split()
+                machine = parts[1] if len(parts) >= 2 else ""
+    if sha.lower() in _NULL_TOKENS:
+        sha = ""
+    if machine.lower() in _NULL_TOKENS:
+        machine = ""
+    return sha, machine
+
+
+def _rewrite_anchor(target_file: str, full_sha: str, machine: str) -> int:
+    refusal = _anchor_write_refusal(full_sha, machine)
+    if refusal:
+        _err(refusal)
+        return 1
+    with open(target_file, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines(keepends=True)
+    stip = smach = False
+    out = []
+    for line in lines:
+        if not stip and line.startswith(_ANCHOR_KEY):
+            out.append(f"covered_tip_sha: {full_sha}\n")
+            stip = True
+            continue
+        if not smach and line.startswith(_MACHINE_KEY):
+            out.append(f"covered_machine: {machine}\n")
+            smach = True
+            continue
+        out.append(line)
+    if stip and not smach:
+        idx = next(i for i, ln in enumerate(out) if ln.startswith("covered_tip_sha:"))
+        out.insert(idx + 1, f"covered_machine: {machine}\n")
+    with open(target_file, "w", encoding="utf-8", newline="\n") as f:
+        f.writelines(out)
+    _declare_write(target_file)
+    return 0
+
+
+def _inject_anchor(target_file: str, full_sha: str, machine: str, today: str) -> int:
+    refusal = _anchor_write_refusal(full_sha, machine)
+    if refusal:
+        _err(refusal)
+        return 1
+    with open(target_file, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines(keepends=True)
+
+    note = (
+        f"> _Record anchor injected {today} by /workday-complete backfill "
+        "(mechanical) — summary content pre-existing._\n"
+    )
+    first_line = lines[0].rstrip("\n") if lines else ""
+
+    out: list[str] = []
+    if first_line == "---":
+        keys_done = False
+        note_done = False
+        for i, line in enumerate(lines):
+            if i == 0:
+                out.append(line)
+                continue
+            if not keys_done and line.rstrip("\n") == "---":
+                out.append(f"covered_tip_sha: {full_sha}\n")
+                out.append(f"covered_machine: {machine}\n")
+                keys_done = True
+                out.append(line)
+                continue
+            if not note_done and line.lower().startswith("# daily summary"):
+                out.append(line)
+                out.append(note)
+                note_done = True
+                continue
+            out.append(line)
+        if not keys_done:
+            _err("ERROR: frontmatter block not closed (no terminating ---); anchor not injected")
+            return 1
+    else:
+        done = False
+        for line in lines:
+            if not done and line.lower().startswith("# daily summary"):
+                out.append(line)
+                out.append("\n")
+                out.append(f"covered_tip_sha: {full_sha}\n")
+                out.append(f"covered_machine: {machine}\n")
+                out.append(note)
+                done = True
+                continue
+            out.append(line)
+        if not done:
+            _err('ERROR: no "# Daily Summary" H1 found in file; cannot inject anchor')
+            return 1
+
+    with open(target_file, "w", encoding="utf-8", newline="\n") as f:
+        f.writelines(out)
+    _declare_write(target_file)
+    return 0
+
+
+def _derive_machine(root: str, full_sha: str, machine_arg: str) -> str:
+    _bootstrap_engine()
+    import workday_ceremony_lib as wc
+
+    if machine_arg:
+        return machine_arg
+    proc = wc.git(
+        "-C", root, "for-each-ref", "--contains", full_sha,
+        "--format=%(refname)", "refs/heads/work/", "refs/remotes/origin/work/",
+        cwd=None,
+    )
+    for ref in proc.stdout.splitlines():
+        m = re.match(r"^refs/heads/work/([^/]+)/", ref)
+        if m:
+            return m.group(1)
+        m = re.match(r"^refs/remotes/origin/work/([^/]+)/", ref)
+        if m:
+            return m.group(1)
+    try:
+        _ensure_claude_klabauter_on_path()
+        from coordinator_core.machine_resolver import compute_machine
+        m = compute_machine()
+        if m:
+            return m
+    except (RuntimeError, ImportError):
+        pass
+    return "unknown"
+
+
+def _completion_count(root: str, date: str) -> int:
+    try:
+        _ensure_claude_klabauter_on_path()
+        from coordinator_core.ops.ceremony.records_query import query_records
+        records = query_records("completion", Path(root), where=f"created={date}")
+    except (RuntimeError, ImportError, SystemExit):
+        _err("WARN: content-completeness guard skipped (native records query unavailable); "
+             "injecting without heuristic check")
+        return 0
+    return len(records)
+
+
+def _bullet_count(target_file: str) -> int:
+    count = 0
+    in_wc = False
+    with open(target_file, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.rstrip("\n")
+            if re.match(r"^##\s", line):
+                in_wc = bool(re.search(r"Work\s Completed", line)) or "Work Completed" in line
+                continue
+            if in_wc and (re.match(r"^[-*]\s", line) or re.match(r"^###\s", line)):
+                count += 1
+    return count
+
+
+def main(argv: list[str]) -> int:
+    _bootstrap_engine()
+    import workday_ceremony_lib as wc
+
+    if len(argv) < 3:
+        _err(f"Usage: {os.path.basename(sys.argv[0])} <ROOT> <DATE> <DESCENDANT_TIP_SHA> [TODAY] [MACHINE]")
+        return 1
+
+    root_raw = argv[0]
+    date = argv[1]
+    descendant_tip_sha = argv[2]
+    today = argv[3] if len(argv) >= 4 and argv[3] else datetime.date.today().strftime("%Y-%m-%d")
+    machine_arg = argv[4] if len(argv) >= 5 else ""
+
+    if not os.path.isdir(root_raw):
+        _err(f"ERROR: ROOT does not exist or is not accessible: {root_raw}")
+        return 1
+    root = os.path.abspath(root_raw)
+
+    if not re.match(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$", date):
+        _err(f"ERROR: DATE must be YYYY-MM-DD (got '{date}')")
+        return 1
+
+    full_sha = wc.git_out("-C", root, "rev-parse", "--verify", f"{descendant_tip_sha}^{{commit}}")
+    if not full_sha:
+        _err(f"ERROR: DESCENDANT_TIP_SHA '{descendant_tip_sha}' does not resolve to a commit in {root}")
+        return 1
+
+    machine = _derive_machine(root, full_sha, machine_arg)
+
+    ds_dir = os.path.join(root, "archive", "daily-summaries")
+    target_file = ""
+    cand1 = os.path.join(ds_dir, f"{date}-{machine}.md")
+    if os.path.isfile(cand1):
+        target_file = cand1
+    if not target_file:
+        for cand in sorted(glob.glob(os.path.join(ds_dir, f"{date}-*.md"))):
+            if os.path.isfile(cand):
+                target_file = cand
+                break
+    if not target_file:
+        cand3 = os.path.join(ds_dir, f"{date}.md")
+        if os.path.isfile(cand3):
+            target_file = cand3
+    if not target_file:
+        _err(f"summary-absent: no summary file found for {date} in {ds_dir}/")
+        return 20
+
+    recorded, recorded_machine = _read_anchor_values(target_file)
+    has_anchor_key = False
+    with open(target_file, "r", encoding="utf-8") as f:
+        has_anchor_key = any(ln.startswith(_ANCHOR_KEY) for ln in f)
+    if has_anchor_key and not recorded:
+        rc = _rewrite_anchor(target_file, full_sha, machine)
+        if rc != 0:
+            return rc
+        _err(f"bumped: {target_file}  covered_tip_sha <null> -> {full_sha}")
+        print(f"TARGET={target_file}")
+        return 0
+    if recorded:
+        rec_full = wc.git_out("-C", root, "rev-parse", "--verify", f"{recorded}^{{commit}}")
+        if rec_full and rec_full == full_sha:
+            if recorded == full_sha and recorded_machine:
+                _err(f"already-anchored (fresh): {target_file}")
+                return 10
+            rc = _rewrite_anchor(target_file, full_sha, recorded_machine or machine)
+            if rc != 0:
+                return rc
+            _err(f"normalised: {target_file}  covered_tip_sha {recorded} -> {full_sha}  "
+                 f"covered_machine {recorded_machine or '<null>'} -> {recorded_machine or machine}")
+            print(f"TARGET={target_file}")
+            return 0
+        if rec_full and wc.git_ok("-C", root, "merge-base", "--is-ancestor", rec_full, full_sha):
+            rc = _rewrite_anchor(target_file, full_sha, machine)
+            if rc != 0:
+                return rc
+            _err(f"bumped: {target_file}  covered_tip_sha {recorded} -> {full_sha}")
+            print(f"TARGET={target_file}")
+            return 0
+        if not rec_full:
+            rc = _rewrite_anchor(target_file, full_sha, machine)
+            if rc != 0:
+                return rc
+            _err(f"bumped: {target_file}  covered_tip_sha <unresolvable:{recorded}> -> {full_sha}")
+            print(f"TARGET={target_file}")
+            return 0
+        _err(f"already-anchored (>= target or divergent): {target_file}")
+        return 10
+
+    completion_count = _completion_count(root, date)
+    bullet_count = _bullet_count(target_file)
+    _err(f"INFO: date={date} file={target_file} completions={completion_count} bullets={bullet_count}")
+    if completion_count >= 3 and completion_count >= bullet_count * 2:
+        _err(f"CONTENT-GAP: {target_file} — {completion_count} completion entries vs "
+             f"{bullet_count} Work Completed bullets; route to Phase A content-assembly analyst")
+        return 30
+
+    range_out = wc.git(
+        "-C", root, "log", full_sha, "--no-merges",
+        f"--since={date} 00:00:00", f"--until={date} 23:59:59", "--format=%H",
+    ).stdout
+    range_shas = [s for s in range_out.splitlines() if s]
+    range_count = len(range_shas)
+    range_set = set(range_shas)
+
+    with open(target_file, "r", encoding="utf-8") as f:
+        body = f.read()
+    tokens = {t.lower() for t in re.findall(r"\b[0-9a-fA-F]{7,40}\b", body)}
+    cited_full: set[str] = set()
+    for tok in tokens:
+        full = wc.git_out("-C", root, "rev-parse", "--verify", "-q", f"{tok}^{{commit}}")
+        if not full:
+            continue
+        if full in cited_full:
+            continue
+        if full in range_set:
+            cited_full.add(full)
+    cited_count = len(cited_full)
+
+    morning_signal = bool(re.search(r"morning run|wraps the tail|spilled past midnight", body, re.IGNORECASE))
+    _err(f"INFO: content-density date={date} range_commits={range_count} "
+         f"cited_shas={cited_count} morning_signal={1 if morning_signal else 0}")
+    if range_count >= 3 and cited_count >= 1 and (cited_count * 2) < range_count:
+        _err(f"CONTENT-GAP: {target_file} — summary cites {cited_count} in-range commit SHAs "
+             f"vs {range_count} commits in the {date} range (<50%); route to Phase A content-assembly analyst")
+        return 30
+    if morning_signal and range_count >= 10:
+        _err(f"CONTENT-GAP: {target_file} — morning-run/tail-wrap note anchored to a "
+             f"{range_count}-commit range; route to Phase A content-assembly analyst")
+        return 30
+
+    rc = _inject_anchor(target_file, full_sha, machine, today)
+    if rc != 0:
+        return rc
+    _err(f"injected: {target_file}  covered_tip_sha={full_sha}  covered_machine={machine}")
+    print(f"TARGET={target_file}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        _ensure_claude_klabauter_on_path()
+        from coordinator_core.cli_entry import recording_declared_writes
+    except (RuntimeError, ImportError):
+        sys.exit(main(sys.argv[1:]))
+    else:
+        with recording_declared_writes():
+            _exit_code = main(sys.argv[1:])
+        sys.exit(_exit_code)

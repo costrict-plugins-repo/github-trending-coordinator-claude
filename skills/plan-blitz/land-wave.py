@@ -1,0 +1,1174 @@
+"""land-wave — land every fire of one plan-blitz wave, and read the stop condition once.
+
+WHY THIS EXISTS. `roadmap.blitz_land` takes ONE fire's result. A wave over the per-fire
+cap is drained by several fires sharing one `waveIndex`, so the landing an EM is holding
+is a FRACTION of the wave — and the skill's stop condition ("a wave that lands zero
+approved AND zero execution_ready AND zero closed") is a WAVE-level test. Reading it off
+one fire is how a healthy blitz gets reported as a stall: measured on this repo, one fire
+of five landed nothing at all while the wave around it had opened nine.
+
+The arithmetic that separates those two readings is a sum across fires. Doing it by hand,
+once per wave, after reading N landing replies, is the step this module removes. It lands
+each fire in order, accumulates the three lanes, and states the stop condition from the
+SUM — never from the last reply it happened to read.
+
+It also removes the second retype at this seam. The wave result is the workflow's own
+returned object, and passing it to the op means copying a large JSON literal out of a
+tool result. This reads it from disk instead — either the raw result or the harness's
+task-output envelope, whichever the caller points at.
+
+WHAT IT DOES NOT DECIDE. Nothing. The verdicts were the wave's op verdicts;
+the op executes them. This module orders the calls and sums the lanes. It does not fire
+the next wave — that stays one explicit call away, which is what keeps a runaway loop
+impossible — and it does not re-queue anything the wave left `pm_only` in `surfacedToPm`.
+
+REFUSALS, all before any landing is attempted:
+
+  - a wave whose fires disagree about `waveIndex`. Two fires at different indices are two
+    waves, and summing their lanes answers a question about neither.
+  - a result carrying a completed `dispatched` entry with no `--shipped-in`, unless every
+    such entry reports the `priorShippedIn` its work already shipped in (a confirm-and-close).
+    The op would refuse those batons one at a time and the wave would read as
+    landed-with-refusals; refusing up front names the actual missing input, which is a
+    commit that has not been made. The op validates each prior itself.
+  - a file that is neither a wave result nor a task-output envelope carrying one.
+
+`--shipped-in` is repeatable and takes two forms: a bare 40-hex SHA (the commit carrying a frozen
+fire's `dispatched` XS work; also the SHA of the single `xsRuns` entry when there is exactly one),
+or `<batonId>=<40-hex SHA>` naming the `dispatch.land_run` SHA of one `xsRuns` entry. Per
+fire, `xsRuns` is transformed on the payload sent to `roadmap.blitz_land` (the archived copy keeps
+it): a mapped entry becomes a ready dispatch row with the SHA as `priorShippedIn`; one whose baton
+already reads `shipped` at a prefix of that SHA, or an unmapped one, becomes a `routedElsewhere`
+row. A malformed value, a baton id matching no entry, and a bare SHA over several entries (or
+alongside a `dispatched` lane) are refused.
+
+The `errored` lane carries entries whose `plan.readiness_verdict` op failed in the wave (an op
+error, not a review verdict). Before `roadmap.blitz_land`, this calls ONLY that op once per entry
+over its preserved `readinessParams`: a coherent `ready` reply with no repairs and a PREPPED
+prep_gate moves the entry to `ready`, any other reply to `pulled`, a failure leaves it `errored`
+with `rerunError`. `--errored-only` re-lands just that lane of an archived fire result.
+
+Usage:
+
+    python3 land-wave.py --repo-root <abs> [--shipped-in <sha> | <batonId>=<sha>]...
+                         [--errored-only] [--branch <name>]
+                         <fire-result.json> [<fire-result.json> ...]
+
+Exit 0 when every fire landed and the wave advanced, 1 when the wave advanced nothing
+(the stop condition — report and stop), 2 on a refusal, 3 when any landing returned a
+non-empty `refused[]`, 4 when entries are still errored after the re-run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+EXIT_OK = 0
+EXIT_WAVE_OPENED_NOTHING = 1
+EXIT_REFUSED = 2
+EXIT_LANDING_REFUSALS = 3
+EXIT_ERRORED = 4
+
+#: The three lanes whose SUM decides whether the wave advanced. `approved` alone is not
+#: the test: an all-S wave approves nothing by construction and still advances, because
+#: `blitz_land` parks each S execution-ready and `needs_plan` keys off that stamp.
+_LANES = ("approved", "execution_ready", "closed")
+
+
+def _wave_result(path: Path) -> dict:
+    """The workflow's returned object, from either shape a caller has on disk.
+
+    A Workflow's return value reaches the caller two ways: inside the harness's
+    task-output envelope (`{summary, agentCount, result, workflowProgress}`), and as the
+    bare object once someone has pulled it out. Accepting only the bare one makes the
+    common case — pointing at the task output file the notification named — fail as
+    "not a wave result", which reads as a broken run rather than a wrapped file.
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: not a JSON object")
+    if "waveIndex" not in data and isinstance(data.get("result"), dict):
+        data = data["result"]
+    if "waveIndex" not in data:
+        raise ValueError(
+            f"{path}: carries no `waveIndex`, so it is neither a plan-blitz wave result "
+            "nor a task-output envelope wrapping one."
+        )
+    return data
+
+
+def _rejected_prior_lines(reply: dict) -> list[str]:
+    """Closed batons whose own prior SHA did not verify and were stamped with the landing's.
+
+    `close_dispatched` takes `prior or shipped_in or ""`, so a prior that verifies correctly wins.
+    One that does NOT verify falls back to the landing's SHA whenever `--shipped-in` was passed —
+    stamping the baton with a commit its work did not ship in. That is the wrong-SHA outcome the
+    caller-side restore exists to prevent, arriving by the one path the restore cannot reach, and
+    the engine records it only as a key on the closed row where no printed summary shows it.
+    """
+    return [
+        f"  PRIOR SHA REJECTED  {row.get('baton') or row.get('batonId')}: "
+        f"{row['prior_shipped_in_rejected']} — this baton is stamped with the LANDING's SHA, "
+        "not the commit its work shipped in."
+        for row in (reply.get("closed") or [])
+        if isinstance(row, dict) and row.get("prior_shipped_in_rejected")
+    ]
+
+
+def _fallback_lines(reply: dict) -> list[str]:
+    """Approved rows the engine landed by the plan route because the S lane refused the kind.
+
+    The row is a real approval and counts as one, but the gate said "execute straight off the
+    spec" and the landing delivered "approved, go through /execute-plan". The engine names that
+    on the row; a count cannot, so a kind the resolved engine does not yet admit — a mirror
+    lagging its source, not a kind refused by design — would otherwise read as ordinary approval.
+    """
+    return [
+        f"{row.get('baton') or row.get('batonId') or '(unnamed)'}: fell back from "
+        f"{row['fell_back_from']} — {row.get('fallback_reason') or 'no reason given'}"
+        for row in (reply.get("approved") or [])
+        if isinstance(row, dict) and row.get("fell_back_from")
+    ]
+
+
+def _stamped_nothing(lane: str, row) -> bool:
+    """The approved lane reports its write as `stamped`; the other two carry the lane's own name.
+
+    Reading only the lane-named flag counted every `approved` row as a write, so a re-landed wave
+    whose plans were all `already at status: approved` reported the same totals as a fresh one.
+    """
+    return isinstance(row, dict) and (row.get(lane) is False or row.get("stamped") is False)
+
+
+def _lane_refusals(reply: dict) -> list[str]:
+    """Rows a lane RETURNED while its own per-row flag says nothing was stamped.
+
+    `blitz_land` catches the stamp's `MutateAbort` and converts it to a return value
+    (`{execution_ready: False, note: ...}`), then appends the row to the lane list
+    unconditionally — so the lane's length counts a refusal as a success and `refused[]`
+    stays empty. Measured by example-game-workbench-repo-b8 on its wave 1 (landing `2014cd58f`,
+    reported `execution_ready: 2`, neither baton stamped), then on this repo's own
+    20260911T145644Z landing: 18 of 22, every one a `kind: spinoff` baton, which
+    `_EXECUTION_PHASE_KINDS` does not admit.
+
+    A baton that reads as parked and is not comes back as a planning candidate, and the
+    next wave re-plans work that already has an approved spec. So these rows join
+    `refused[]`, where the skill's standing "read `refused[]` on every landing" rule
+    already looks.
+    """
+    lines = []
+    for lane in _LANES:
+        for row in reply.get(lane) or []:
+            if not _stamped_nothing(lane, row):
+                continue
+            baton = row.get("baton") or row.get("batonId") or "(unnamed)"
+            note = row.get("note") or "the op stamped nothing and said no more"
+            lines.append(f"{baton}: {lane} returned FALSE — {note}")
+            lines.extend(_executor_prestamp_diagnosis(lane, baton, note))
+    return lines
+
+
+def _executor_prestamp_diagnosis(lane: str, baton: str, note: str) -> list[str]:
+    """Name the one cause a terminal-state refusal on the XS lane almost always has.
+
+    The dispatch lane closes a baton the wave's own XS executor just worked on, so the only
+    party that can have made it terminal first is that executor — and the brief forbidding it
+    (`workflows/plan-blitz.mjs` § Never stamp the baton's lifecycle frontmatter) has been read
+    past in a live run, with the wave's own readiness note observing the write and passing it
+    as schema-legal. The refusal that follows reads as a conflict to adjudicate, when what it
+    actually reports is a DIFFERENT terminal than the one the close was going to write:
+    `closed` + a `closed_reason` against `shipped` + the wave's `shipped_in` SHA. The executor's
+    terminal keeps no link to the commit carrying the work, which is the whole content of the
+    stamp it pre-empted — so "it ended up where it was going anyway" is the reading to refuse.
+    """
+    if lane != "closed" or "terminal" not in note.lower():
+        return []
+    return [
+        f"  ^ {baton}: the XS executor almost certainly stamped lifecycle frontmatter itself "
+        "(deployment_state/closed_reason), which the landing owns. Read the baton: if it is "
+        "closed rather than shipped, it carries no shipped_in and nothing links it to the "
+        "commit holding its work.",
+    ]
+
+
+def _restore_prior_shipped_in(result: dict) -> list[str]:
+    """Put `priorShippedIn` back on a ready row that a wave built without it.
+
+    `blitz_land` reads the field off the READY row. The wave has two paths to such a row for a
+    dispatched XS — a synthetic one for the batons its gate did not judge, which carries the
+    field, and the gate's own verdict for the ones it did, which did not. So a confirm-and-close
+    whose work shipped months ago was refused for want of a SHA it was carrying two keys away, in
+    the same result.
+
+    Measured on fire-0-14 of this run: three batons, three distinct prior commits, all three
+    refused. The workflow is fixed, but every fire already emitted is a FROZEN COPY of the old one
+    and cannot be, so the repair belongs here too — and here it is also strictly better, because
+    the alternative a driver reaches for is `--shipped-in` with one SHA, which stamps three batons
+    that shipped in three different commits with a single wrong one.
+
+    Copies, never invents: the value comes from this same result's own `dispatched` entry, and
+    only where that entry completed. It is the transform the wave now performs, applied to a
+    result written before it did.
+    """
+    by_id = {
+        d["batonId"]: d
+        for d in (result.get("dispatched") or [])
+        if isinstance(d, dict) and d.get("batonId")
+    }
+    restored = []
+    for row in result.get("ready") or []:
+        if not isinstance(row, dict) or row.get("priorShippedIn"):
+            continue
+        entry = by_id.get(row.get("batonId"))
+        if entry and entry.get("completed") and entry.get("priorShippedIn"):
+            row["priorShippedIn"] = entry["priorShippedIn"]
+            restored.append(f"{row['batonId']} -> {entry['priorShippedIn'][:9]}")
+    if not restored:
+        return []
+    return [
+        "land-wave: restored priorShippedIn from the result's own dispatched rows for: "
+        + ", ".join(restored),
+        "  These came from this result, not from an assumption. Without them the landing refuses "
+        "each baton for want of a SHA it was already carrying.",
+    ]
+
+
+_SHA40 = re.compile(r"[0-9a-fA-F]{40}")
+
+
+def _parse_shipped_in(values: list[str]) -> tuple[str | None, dict[str, str], str | None]:
+    """Split repeated `--shipped-in` values into `(bare_sha, {batonId: sha}, error)`.
+
+    A value is a bare 40-hex SHA or `<batonId>=<40-hex>`. At most one bare value is allowed, and
+    a baton id may appear once.
+    """
+    bare: str | None = None
+    per_baton: dict[str, str] = {}
+    for raw in values:
+        baton, sep, sha = raw.partition("=")
+        if not sep:
+            baton, sha = "", raw
+        if not _SHA40.fullmatch(sha):
+            return None, {}, f"--shipped-in {raw!r} is not a 40-hex SHA or <batonId>=<40-hex SHA>."
+        if baton:
+            if baton in per_baton:
+                return None, {}, f"--shipped-in names baton {baton!r} twice."
+            per_baton[baton] = sha
+        elif bare is not None:
+            return None, {}, "--shipped-in carries more than one bare SHA."
+        else:
+            bare = sha
+    return bare, per_baton, None
+
+
+_MIN_SHIPPED_PREFIX = 7  # shortest `shipped_in` prefix trusted as a match; git's default abbrev floor
+_FM_FIELD = r"^{key}:\s*[\"']?([^\"'\n]*?)[\"']?\s*$"
+
+
+def _baton_ship_state(repo_root: Path, record: str) -> tuple[str, str]:
+    """`(deployment_state, shipped_in)` read off the baton's frontmatter; empty when unreadable."""
+    try:
+        text = (repo_root / record).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "", ""
+    head = text.split("\n---", 1)[0] if text.startswith("---") else ""
+    out = []
+    for key in ("deployment_state", "shipped_in"):
+        m = re.search(_FM_FIELD.format(key=key), head, re.MULTILINE)
+        out.append(m.group(1).strip() if m else "")
+    return out[0], out[1]
+
+
+def _transform_xs_runs(result: dict, mapping: dict[str, str], repo_root: Path) -> list[str]:
+    """Replace `xsRuns` on `result` with `ready` / `routedElsewhere` rows, then drop the key.
+
+    A mapped entry becomes a ready dispatch row carrying the SHA as `priorShippedIn`, unless the
+    baton already reads `shipped` at a `shipped_in` prefix-matching that SHA (land_run's
+    close_background baton-ship leg stamps the 8-char prefix), in which case `close_dispatched`
+    would refuse it and it is routed elsewhere. An unmapped entry is routed elsewhere and returns as a candidate.
+    Returns one stderr line per entry.
+    """
+    lines = []
+    for run in result.pop("xsRuns", None) or []:
+        if not isinstance(run, dict) or not run.get("batonId"):
+            continue
+        baton = run["batonId"]
+        sha = mapping.get(baton)
+        if not sha:
+            reason = "XS run landed no land_run SHA; returns as a candidate"
+            result.setdefault("routedElsewhere", []).append(
+                {"batonId": baton, "route": "dispatch", "reason": reason})
+            lines.append(f"land-wave: xsRun {baton}: not landed — {reason}")
+            continue
+        state, stamped = _baton_ship_state(repo_root, run.get("record") or "")
+        if state == "shipped" and len(stamped) >= _MIN_SHIPPED_PREFIX and sha.lower().startswith(stamped.lower()):
+            reason = f"closed by land_run's baton-ship leg at {sha[:8]}"
+            result.setdefault("routedElsewhere", []).append(
+                {"batonId": baton, "route": "dispatch", "reason": reason})
+            lines.append(f"land-wave: xsRun {baton}: closed-by-baton-ship at {sha[:8]}")
+            continue
+        result.setdefault("ready", []).append({
+            "batonId": baton, "verdict": "ready", "route": "dispatch", "planPath": None,
+            "reviewVerdicts": [], "priorShippedIn": sha,
+            "reason": f"XS run closed by dispatch.land_run {sha[:8]}",
+        })
+        lines.append(f"land-wave: xsRun {baton}: closed at {sha[:8]}")
+    return lines
+
+
+_ERRORED_ONLY_EMPTIED = (
+    "ready", "pulled", "replan", "surfacedToPm", "dispatched", "xsRuns",
+    "routedElsewhere", "adjudicated",
+)
+_REPLY_VERDICTS = ("ready", "pulled", "judgment")
+_REPLY_PULL_CLASSES = ("none", "mechanical", "substantive")
+
+
+def _reply_is_coherent(reply) -> bool:
+    """The `honouredReadiness` coherence bar: a known verdict and pull_class, list repairs, a
+    dict prep_gate, and repairs present exactly when pull_class is `mechanical`."""
+    if not isinstance(reply, dict):
+        return False
+    repairs = reply.get("mechanical_repairs")
+    return (
+        reply.get("verdict") in _REPLY_VERDICTS
+        and reply.get("pull_class") in _REPLY_PULL_CLASSES
+        and isinstance(repairs, list)
+        and isinstance(reply.get("prep_gate"), dict)
+        and bool(repairs) == (reply.get("pull_class") == "mechanical")
+    )
+
+
+def _rerun_errored(payload: dict, repo_root: Path, engine_root: Path | None,
+                   live_engine_tree: bool) -> list[str]:
+    """Re-run ONLY `plan.readiness_verdict` once per `errored` entry, over its `readinessParams`.
+
+    An entry reaches `ready` only on a coherent `ready` reply with no repairs and a PREPPED
+    prep_gate; any other coherent reply moves it to `pulled` with the op's own pull_class, an
+    incoherent one to `pulled`/`unusable`, and a failure leaves it `errored` with the new error
+    verbatim as `rerunError`. Mutates `payload`'s lanes; returns one stderr line per entry.
+    """
+    lines: list[str] = []
+    still: list = []
+    for entry in payload.get("errored") or []:
+        if not isinstance(entry, dict):
+            still.append(entry)
+            continue
+        baton = entry.get("batonId") or "(unnamed)"
+        params = entry.get("readinessParams")
+        if not isinstance(params, dict) or not params:
+            lines.append(f"land-wave: errored {baton}: no readinessParams to re-run; stays errored")
+            still.append(entry)
+            continue
+        try:
+            reply = _invoke(repo_root, engine_root, "plan.readiness_verdict", params,
+                            live_engine_tree)
+        except ValueError as exc:
+            lines.append(f"land-wave: errored {baton}: re-run failed — {exc}")
+            still.append({**entry, "rerunError": str(exc)})
+            continue
+        moved = {k: v for k, v in entry.items() if k != "rerunError"}
+        moved["rerunOf"] = "errored"
+        if not _reply_is_coherent(reply):
+            moved.update(verdict="pulled", pullClass="unusable",
+                         reason="the re-run returned no coherent plan.readiness_verdict reply")
+            payload.setdefault("pulled", []).append(moved)
+            lines.append(f"land-wave: errored {baton}: re-run reply incoherent; pulled (unusable)")
+            continue
+        gate = reply["prep_gate"]
+        if (reply["verdict"] == "ready" and not reply["mechanical_repairs"]
+                and gate.get("verdict") == "PREPPED"):
+            moved["verdict"] = "ready"
+            payload.setdefault("ready", []).append(moved)
+            lines.append(f"land-wave: errored {baton}: re-run ready")
+            continue
+        moved.update(
+            verdict="pulled", pullClass=reply["pull_class"],
+            reason=reply.get("reason") or f"the re-run verdict was {reply['verdict']}",
+            prepGateReport=gate.get("message"),
+        )
+        payload.setdefault("pulled", []).append(moved)
+        lines.append(f"land-wave: errored {baton}: re-run {reply['verdict']}; pulled "
+                     f"({reply['pull_class']})")
+    if "errored" in payload:
+        payload["errored"] = still
+    return lines
+
+
+def _archive_result(result: dict) -> Path | None:
+    """Persist a fire's own returned object into that fire's trail slot.
+
+    WHY. The trail archives what was FIRED — the emitted `.mjs` carries its bound
+    args — and, until this, nothing archived what a fire RETURNED. A wave's
+    verdicts therefore existed only inside a tool call, and that is not a
+    cosmetic gap: `roadmap.blitz_land` takes the wave result verbatim, so a
+    landing cannot be re-run once the session holding it ends. Measured on
+    the engine repo, run 20260910T000000Z: two XS batons finished, their landing
+    never stamped them, `recycle-check.py` correctly named them RECYCLED — and
+    the documented repair ("re-run the landing with the SHA") was unreachable,
+    because the trail held hand-written baton arrays and no fire result. The
+    verdicts had to be reconstructed from the execution records instead.
+
+    Written to `trailSlotDir` rather than `trailDir`: the slot is this fire's own
+    leaf, so several fires of one wave cannot overwrite each other's result —
+    the same keying the wave-scoped sidecars already use. Best-effort by
+    design: this is a durability improvement to the trail, and a landing that
+    otherwise succeeds must not be refused because the trail was unwritable.
+    """
+    slot = result.get("trailSlotDir") or result.get("trailDir")
+    if not slot:
+        return None
+    target = Path(slot)
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        out = target / "wave-result.json"
+        out.write_text(json.dumps(result, indent=1), encoding="utf-8")
+        return out
+    except OSError as exc:
+        print(f"land-wave: could not archive the fire result under {target}: {exc}",
+              file=sys.stderr)
+        return None
+
+
+def _invoke_argv(engine_root: Path | None, live_engine_tree: bool) -> tuple[list[str], list[str], dict]:
+    """The command, trailing flags and environment that dispatch an op — and against WHICH code.
+
+    Under `--live-engine-tree` the answer is the named tree's own trampoline, run COLD. The
+    engine's `--allow-unstamped-dispatch` alone still takes the warm path, and a warm server
+    booted from an unstamped tree never retires on a code change — it cannot trip the superseded
+    check, so it serves whatever it loaded at boot until it idles out. This flag exists to reach
+    an engine fix that is not published yet, and on a state-mutating op the warm path can serve
+    the tree from before that fix with nothing saying so. Measured on a re-land: it refused a
+    baton the authoring tree's HEAD lands, because the serving code predated the fix by one
+    commit. `COORDINATOR_WARM=0` is the engine's own per-invocation escape hatch, and the flag is
+    its sanctioned CLI opt-out — so neither is a new way past the stamp gate.
+    """
+    env = dict(os.environ)
+    if live_engine_tree and engine_root is not None:
+        env["COORDINATOR_ENGINE_ROOT"] = str(engine_root)
+        env["COORDINATOR_WARM"] = "0"
+        return (
+            [sys.executable, str(engine_root / "coordinator" / "bin" / "coordinator-invoke.py")],
+            ["--allow-unstamped-dispatch"],
+            env,
+        )
+    settings_home = os.environ.get("COORDINATOR_SETTINGS_HOME") or str(
+        Path(os.environ.get("CLAUDE_HOME") or Path.home()) / ".coordinator-claude-settings"
+    )
+    bin_dir = Path(settings_home) / "bin"
+    # The Windows launcher is `coordinator-invoke.exe`; the bare name beside it is a POSIX script.
+    launcher = next(
+        (bin_dir / n for n in ("coordinator-invoke.exe", "coordinator-invoke") if (bin_dir / n).is_file()),
+        bin_dir / "coordinator-invoke",
+    )
+    if launcher.is_file():
+        cmd = [str(launcher)]
+    elif engine_root is not None:
+        cmd = [sys.executable, str(engine_root / "coordinator" / "bin" / "coordinator-invoke.py")]
+    else:
+        raise ValueError(
+            f"no coordinator-invoke launcher at {launcher}, and no --engine-root or "
+            "$COORDINATOR_ENGINE_ROOT to fall back to."
+        )
+    if engine_root is not None:
+        env.setdefault("COORDINATOR_ENGINE_ROOT", str(engine_root))
+    return cmd, [], env
+
+
+def _invoke(repo_root: Path, engine_root: Path | None, op: str, params: dict,
+            live_engine_tree: bool = False) -> dict:
+    cmd, tail, env = _invoke_argv(engine_root, live_engine_tree)
+    proc = subprocess.run(
+        cmd + [op, json.dumps(params)] + tail,
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(repo_root),
+        timeout=600,
+    )
+    # A JSON-RPC refusal still exits non-zero, and the engine writes its `[warm-settings]`
+    # line to stderr. Preferring stderr on a non-zero exit therefore reports the chatter as
+    # the failure and DISCARDS the refusal — and `roadmap.blitz_land`'s refusals are the
+    # ones that must never be routed around. Parse stdout first.
+    # `A-PUBLISHED-MIRROR-OLDER-THAN-AN-OP-REFUSES-AS-A-MISSING-ENGINE`.
+    try:
+        reply = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        reply = None
+    if not isinstance(reply, dict):
+        raise ValueError(
+            f"{op} failed (exit {proc.returncode}): {(proc.stderr or proc.stdout).strip()[:800]}"
+        )
+    if "error" in reply:
+        err = reply["error"]
+        message = str((err or {}).get("message") or err) if isinstance(err, dict) else str(err)
+        raise ValueError(f"{op} refused: {message}")
+    # Stdout-first does NOT mean exit-code-blind. A well-formed reply carrying no `error`
+    # alongside a non-zero exit is the engine failing in a way its envelope did not
+    # describe, and returning `result` there reports that failure as success — the exact
+    # inversion of the defect this parse order was introduced to fix.
+    if proc.returncode != 0:
+        raise ValueError(
+            f"{op} exited {proc.returncode} while returning a result envelope with no "
+            f"`error`. Treating that as success would report a failure as a landing. "
+            f"stderr: {(proc.stderr or '').strip()[:800]}"
+        )
+    if "result" not in reply:
+        raise ValueError(f"{op} returned a reply carrying neither `result` nor `error`")
+    return reply["result"]
+
+
+
+def _refuse_live_tree_on_a_stamped_engine(engine_root, live_engine_tree: bool) -> str | None:
+    """Enforce `--live-engine-tree`'s own stated precondition, or refuse.
+
+    The flag forwards the engine's `--allow-unstamped-dispatch`, whose own help reads
+    "For deliberate manual testing of engine changes ONLY". Unconditioned, it applies to
+    whichever rung resolved — including a settings-home launcher on a fully installed box
+    with a stamped published engine, which is precisely the case it must never touch.
+
+    It also disarms MORE than the stamp gate: the same engine flag decides whether a
+    warm-unavailable dispatch may fall through to a cold spawn, so passing it re-enables
+    a silent-slow degrade. Both are reasons to require that the caller really is pointed
+    at an unstamped tree before it is honoured.
+    """
+    if not live_engine_tree:
+        return None
+    if engine_root is None:
+        return (
+            "--live-engine-tree needs --engine-root: it exists to reach an UNSTAMPED "
+            "authoring tree, and without one it would hand the engine's manual-testing "
+            "carve-out to whatever rung happens to resolve, installed box included."
+        )
+    if (engine_root / "coordinator_core" / "_engine_stamp").is_file():
+        return (
+            f"--live-engine-tree refused: {engine_root} carries a build stamp, so it is a "
+            "PUBLISHED engine and needs no carve-out. The flag disarms the stamp gate AND "
+            "the cold-fallback refusal; neither is appropriate against a published mirror. "
+            "Drop the flag."
+        )
+    return None
+
+
+_LANDING_ROOTS = ("state/handoffs/", "archive/handoffs/", "state/roadmap/", "docs/plans/")
+
+
+def _commit_own_records(repo_root: Path, engine_root: Path | None, paths: list[str],
+                        wave_index, live_engine_tree: bool) -> tuple[list[str], list[str]]:
+    """Commit `paths` as one scoped commit; return `(committed, held)`.
+
+    A refusal that names some of `paths` (a peer holds them) drops exactly those and retries
+    with the remainder, so a peer-held path is reported once instead of one refusal per run.
+    A refusal naming none of them holds everything: the pathspec is never widened and a
+    failure never reads as a commit.
+    """
+    remaining = list(paths)
+    held: list[str] = []
+    message = f"plan-blitz: land wave {wave_index} records"
+    while remaining:
+        try:
+            _invoke(repo_root, engine_root, "ceremony.commit_v2",
+                    {"paths": remaining, "message": message}, live_engine_tree)
+            return remaining, held
+        except ValueError as exc:
+            named = [p for p in remaining if p in str(exc)]
+            if not named:
+                print(f"land-wave: the scoped commit of the wave's records failed — {exc}",
+                      file=sys.stderr)
+                return [], sorted([*held, *remaining])
+            held.extend(named)
+            remaining = [p for p in remaining if p not in named]
+    return [], sorted(held)
+
+
+def _repo_relative(value: str, repo_root: Path) -> str | None:
+    """`value` as a forward-slash repo-relative path, or None when it names nothing here.
+
+    Trail records have been measured writing `planPath` in two shapes — absolute on some entries,
+    repo-relative on others — so both are normalised rather than trusting either.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    p = Path(value.strip())
+    if p.is_absolute():
+        try:
+            p = p.resolve().relative_to(repo_root)
+        except ValueError:
+            return None
+    return p.as_posix()
+
+
+#: Reply keys that describe the NEXT wave, not this one. A next-wave baton's plan or handoff can be
+#: dirty for any reason — a peer's edit, an earlier run's uncommitted body — and none of it is a
+#: record this wave wrote.
+_NOT_THIS_WAVE = frozenset({"next_wave"})
+
+
+def _strings(node):
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for k, v in node.items():
+            if k not in _NOT_THIS_WAVE:
+                yield from _strings(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _strings(v)
+
+
+def _landing_pathspec(fires: list, replies: list, repo_root: Path) -> list[str]:
+    """Every path this wave's OWN records name that is now uncommitted.
+
+    `roadmap.blitz_land` does not commit, by its own negative spec, and this helper used to say
+    nothing about what the caller then owes. Measured 2026-09-11, twice on one run: one fire's
+    landing stamps and another's reviewed plan rewrites were never committed, because the
+    landing commit named what the landing stamped and missed what the FIRE wrote. The next emit
+    then HELD three batons as "uncommitted record — a live writer is still on them", against the
+    driver's own work.
+
+    Candidates come only from this wave's records — each fire's trail slot, every `planPath` its
+    lanes cite, and every handoff/roadmap/plan path in the landing replies — and are then
+    intersected with `git status`. Never a directory sweep: a shared tree carries peer sessions,
+    and a pathspec that sweeps `state/handoffs/` commits their work under this wave's name.
+    """
+    return _dirty_among(_landing_candidates(fires, replies, repo_root), repo_root)
+
+
+def _landing_candidates(fires: list, replies: list, repo_root: Path) -> set[str]:
+    """The paths this wave's own records name, dirty or not. Reads the trail root's listing and
+    the text of the records it collects, never git, so it is tested without a repository."""
+    candidates: set[str] = set()
+    for _, result in fires:
+        slot = _repo_relative(result.get("trailSlotDir") or "", repo_root)
+        if slot:
+            candidates.add(slot)
+        # The trail ROOT's own files too — the fire script, the frozen gate report, the landing
+        # declaration this helper writes. Files only, never the root's other slots: a sibling fire
+        # of this run may still be airborne, and committing its partial records would clear the
+        # dirty-record HOLD that keeps the next emit off its batons.
+        trail = _repo_relative(result.get("trailDir") or "", repo_root)
+        if trail and (repo_root / trail).is_dir():
+            candidates.update(
+                f"{trail}/{child.name}" for child in (repo_root / trail).iterdir() if child.is_file()
+            )
+        for lane in ("ready", "pulled", "replan", "errored"):
+            for entry in result.get(lane) or []:
+                if isinstance(entry, dict):
+                    rel = _repo_relative(entry.get("planPath") or "", repo_root)
+                    if rel:
+                        candidates.add(rel)
+    for reply in replies:
+        for s in _strings(reply):
+            rel = _repo_relative(s, repo_root)
+            if rel and rel.startswith(_LANDING_ROOTS) and rel.endswith((".md", ".yaml")):
+                candidates.add(rel)
+    candidates |= _cited_records(candidates, repo_root)
+    candidates |= _replan_sources(candidates, repo_root)
+    return candidates
+
+
+_REPLAN_OF = re.compile(r"^replan_of:", re.MULTILINE)
+_FORKED_FROM = re.compile(r"^forked_from:\s*[\"']?([^\"'\n]+?)[\"']?\s*$", re.MULTILINE)
+
+
+def _replan_sources(candidates: set[str], repo_root: Path) -> set[str]:
+    """The SOURCE baton of every replan this wave minted.
+
+    `blitz_land` re-stamps the source `claimed`/`continued` in the same landing, but the reply
+    names only the minted replan. The replan's own `forked_from:` is the one record naming the
+    source. Read only from minted replans (`replan_of:` present) under `state/handoffs/`, so a
+    plan's or peer baton's lineage never widens the set.
+    """
+    sources: set[str] = set()
+    for rel in candidates:
+        if not (rel.startswith("state/handoffs/") and rel.endswith(".md")):
+            continue
+        try:
+            text = (repo_root / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if not _REPLAN_OF.search(text):
+            continue
+        match = _FORKED_FROM.search(text)
+        src = match and _repo_relative(match.group(1).strip(), repo_root)
+        if src and src.startswith(_LANDING_ROOTS):
+            sources.add(src)
+    return sources
+
+
+#: Records a wave WRITES that no lane field names: the scout's sizing object (named only by the
+#: plan's `sizing_object:` and the slot's sizing record) and the queue rows a planner
+#: spins off (named only in the slot's prose). Missed, they sit uncommitted after the
+#: landing commit — measured 2026-09-22, 37 sizings and one debt row on one wave.
+_CITED_RECORD = re.compile(
+    r"(?<![\w.-])(state/(?:sizings|debt-backlog|bug-backlog|improvement-queue)/[\w.-]+\.yaml)"
+)
+
+
+def _cited_records(candidates: set[str], repo_root: Path) -> set[str]:
+    """Sizing objects and queue rows cited by the text of this wave's own records.
+
+    Reads only files already in `candidates` (the slot's files, the plans, the handoffs), so the
+    set stays bounded by what this wave's records name — a citation is not a directory sweep.
+    """
+    cited: set[str] = set()
+    for rel in candidates:
+        path = repo_root / rel
+        files = path.rglob("*") if path.is_dir() else (path,)
+        for f in files:
+            if f.suffix not in (".md", ".yaml", ".json") or not f.is_file():
+                continue
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            cited.update(_CITED_RECORD.findall(text))
+    return cited
+
+
+def _dirty_among(candidates: set[str], repo_root: Path, run=subprocess.run) -> list[str]:
+    """`candidates` intersected with `git status`, renames resolved to their destination. `run`
+    is injectable so the porcelain parse is tested without spawning git."""
+    if not candidates:
+        return []
+    try:
+        out = run(
+            ["git", "status", "--porcelain", "--untracked-files=all", "--", *sorted(candidates)],
+            cwd=str(repo_root), capture_output=True, text=True, encoding="utf-8", check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    dirty = []
+    for line in out.splitlines():
+        path = line[3:].strip().strip('"')
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        if path:
+            dirty.append(path)
+    return sorted(set(dirty))
+
+
+def _landing_slot(fire_names: list[str]) -> str:
+    """Deterministic key for the fire set a call landed; disjoint sets never share a path."""
+    return hashlib.sha1("\n".join(sorted(fire_names)).encode("utf-8")).hexdigest()[:8]
+
+
+def read_wave_landings(trail: Path, wave_index: int) -> dict | None:
+    """Aggregate every `wave-<n>.landing*.json` in `trail` (legacy single file included).
+
+    Sessions landing different fires of one wave each write their own file, so a reader that
+    opens one path sees a fraction of the wave. Totals sum, lists concatenate, `nextWave` comes
+    from the newest file. None when no landing file exists or parses.
+    """
+    files = [
+        f for f in trail.glob(f"wave-{wave_index}.landing*.json")
+        if re.fullmatch(rf"wave-{wave_index}\.landing(\.[0-9a-f]+)?\.json", f.name)
+    ]
+    docs = []
+    for f in sorted(files, key=lambda f: (f.stat().st_mtime, f.name)):
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict):
+            docs.append(d)
+    if not docs:
+        return None
+    agg = {"waveIndex": wave_index, "totals": {}, "advanced": 0, "nextWave": None}
+    for key in ("refused", "surfacedToPm", "fellBack", "landings", "uncommitted"):
+        agg[key] = []
+    agg["adjudicated"] = 0
+    for d in docs:
+        for lane, n in (d.get("totals") or {}).items():
+            agg["totals"][lane] = agg["totals"].get(lane, 0) + n
+        agg["advanced"] += d.get("advanced") or 0
+        agg["adjudicated"] += d.get("adjudicated") or 0
+        for key in ("refused", "surfacedToPm", "fellBack", "landings", "uncommitted"):
+            agg[key].extend(d.get(key) or [])
+        if d.get("nextWave") is not None:
+            agg["nextWave"] = d["nextWave"]
+    agg["uncommitted"] = sorted(set(agg["uncommitted"]))
+    return agg
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="land-wave",
+        description="Land every fire of one plan-blitz wave and read the stop condition once.",
+    )
+    ap.add_argument("results", nargs="+", help="one wave-result (or task-output) JSON per fire")
+    ap.add_argument("--repo-root", required=True, help="ABSOLUTE repo root")
+    ap.add_argument("--engine-root", help="engine checkout (default: $COORDINATOR_ENGINE_ROOT)")
+    ap.add_argument(
+        "--shipped-in",
+        action="append",
+        default=[],
+        help="Repeatable. Either a bare 40-hex SHA of the commit carrying this wave's XS work "
+        "(required when any fire dispatched; also maps to the single `xsRuns` entry when there "
+        "is exactly one), or <batonId>=<40-hex SHA> naming the dispatch.land_run SHA of "
+        "one `xsRuns` entry. Each mapped entry lands as a ready dispatch row carrying the SHA "
+        "as priorShippedIn; one already shipped at that SHA is routed elsewhere; an unmapped "
+        "entry is routed elsewhere and returns as a candidate.",
+    )
+    ap.add_argument(
+        "--live-engine-tree",
+        action="store_true",
+        help=(
+            "the --engine-root given is claude-klabauter's live authoring tree, which "
+            "carries no build stamp. Takes the engine's own live-tree path (the PM's "
+            "manual test-and-execute carve-out) for this landing's ops. Its case is a "
+            "box whose published mirror predates a fix the landing depends on — the "
+            "same rung `emit-wave-fire --live-engine-tree` takes for the bind call."
+        ),
+    )
+    ap.add_argument(
+        "--errored-only",
+        action="store_true",
+        help="re-land only the `errored` lane of an archived fire result: every other lane is "
+        "emptied, so rows that already landed are not landed again. Use it after fixing the "
+        "op failure that left entries errored; never re-fire the wave (it re-reviews).",
+    )
+    ap.add_argument("--branch", default="main", help="branch recorded on any minted replan baton")
+    ap.add_argument("--limit", type=int, default=8, help="max batons in the emitted next wave")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument(
+        "--no-commit",
+        action="store_true",
+        help="leave the records this landing wrote uncommitted and name them instead",
+    )
+    args = ap.parse_args(argv)
+
+    def refuse(msg: str) -> int:
+        print(f"land-wave: REFUSED — {msg}", file=sys.stderr)
+        return EXIT_REFUSED
+
+    repo_root = Path(args.repo_root).resolve()
+    _er = args.engine_root or os.environ.get("COORDINATOR_ENGINE_ROOT") or ""
+    engine_root = Path(_er).resolve() if _er.strip() else None
+
+    live_tree_refusal = _refuse_live_tree_on_a_stamped_engine(
+        engine_root, args.live_engine_tree
+    )
+    if live_tree_refusal:
+        print(f"land-wave: REFUSED — {live_tree_refusal}", file=sys.stderr)
+        return EXIT_REFUSED
+    if args.live_engine_tree:
+        # `roadmap.blitz_land` MUTATES state — it links plans, stamps `approved` and
+        # `shipped`, mints replan batons. The engine's own help for the flag this
+        # forwards says live ops must never pass it, so the one honest mitigation is to
+        # say out loud what was disarmed and against which tree.
+        print(
+            f"land-wave: --live-engine-tree — landing through UNSTAMPED {engine_root}. "
+            "This disarms the build-stamp gate AND the cold-fallback refusal, for a "
+            "state-mutating op. Use it only to reach an engine fix that is not published "
+            "yet.",
+            file=sys.stderr,
+        )
+
+    fires = []
+    for raw in args.results:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = repo_root / p
+        if not p.is_file():
+            return refuse(f"no wave result at {p}")
+        try:
+            fires.append((p, _wave_result(p)))
+        except ValueError as exc:
+            return refuse(str(exc))
+
+    if args.errored_only:
+        for _, r in fires:
+            for lane in _ERRORED_ONLY_EMPTIED:
+                if lane in r:
+                    r[lane] = []
+
+    indices = {r.get("waveIndex") for _, r in fires}
+    if len(indices) != 1:
+        return refuse(
+            f"the fires name {sorted(indices, key=str)} as their waveIndex. Two fires at "
+            "different indices are two waves, and summing their lanes answers a question "
+            "about neither. Land each wave separately."
+        )
+    wave_index = indices.pop()
+
+    # `completed: true` is the discriminator, not the presence of a `dispatched` entry.
+    # A wave records every XS it dispatched, including the ones that declined: a baton
+    # whose wait-gate was still shut reports `completed: false`, touches no file, and is
+    # routed to `pulled` rather than closed — there is no commit for it to cite, and
+    # demanding one refuses a wave that has nothing to ship. Measured wave 0 here: one
+    # dispatched baton, zero files changed, correctly declined.
+    # A confirm-and-close whose work shipped long ago reports that commit as `priorShippedIn`,
+    # and `blitz_land` stamps it in place of the landing's SHA. Only a completed entry WITHOUT
+    # one needs a landing commit to cite.
+    bare_sha, per_baton, shipped_err = _parse_shipped_in(args.shipped_in)
+    if shipped_err:
+        return refuse(shipped_err)
+    xs_ids = [
+        e["batonId"]
+        for _, r in fires
+        for e in (r.get("xsRuns") or [])
+        if isinstance(e, dict) and e.get("batonId")
+    ]
+    unknown = sorted(set(per_baton) - set(xs_ids))
+    if unknown:
+        return refuse(f"--shipped-in names {unknown}, which match no `xsRuns` entry in these fires.")
+    xs_mapping = dict(per_baton)
+    if bare_sha and xs_ids:
+        if any(r.get("dispatched") for _, r in fires):
+            return refuse(
+                "a bare --shipped-in cannot be both the hand commit for a frozen fire's `dispatched` "
+                "lane and the land_run SHA of an `xsRuns` entry. Pass the XS SHA as "
+                "<batonId>=<sha>."
+            )
+        if len(xs_ids) > 1:
+            return refuse(
+                f"a bare --shipped-in with {len(xs_ids)} `xsRuns` entries would stamp several "
+                "XS runs with one SHA. Pass <batonId>=<sha> per baton."
+            )
+        xs_mapping.setdefault(xs_ids[0], bare_sha)
+
+    dispatching = [
+        str(p)
+        for p, r in fires
+        if any(
+            e.get("completed") and not e.get("priorShippedIn")
+            for e in (r.get("dispatched") or [])
+            if isinstance(e, dict)
+        )
+    ]
+    if dispatching and not bare_sha:
+        return refuse(
+            "these fires dispatched XS work and no --shipped-in was given: "
+            + ", ".join(dispatching)
+            + ". Commit the wave's XS work first and pass that SHA. Without it the XS lane "
+            "refuses and those batons stay open, which is the recycling defect, not a "
+            "cosmetic gap."
+        )
+
+    totals = {lane: 0 for lane in _LANES}
+    landings, all_refused, all_surfaced, all_fell_back = [], [], [], []
+    adjudicated = 0
+    next_wave = None
+    still_errored: list[dict] = []
+
+    for path, result in fires:
+        adjudicated += len(result.get("adjudicated") or [])
+        for line in _restore_prior_shipped_in(result):
+            print(line, file=sys.stderr)
+        # An `--errored-only` result has its lanes emptied above; archiving it would overwrite
+        # the full fire result it was read from.
+        archived = None if args.errored_only else _archive_result(result)
+        payload = {k: list(v) if isinstance(v, list) else v for k, v in result.items()}
+        for line in _transform_xs_runs(payload, xs_mapping, repo_root):
+            print(line, file=sys.stderr)
+        for line in _rerun_errored(payload, repo_root, engine_root, args.live_engine_tree):
+            print(line, file=sys.stderr)
+        still_errored.extend(
+            {"batonId": e.get("batonId"), "planPath": e.get("planPath"),
+             "opError": e.get("opError"), "rerunError": e.get("rerunError")}
+            for e in payload.get("errored") or [] if isinstance(e, dict)
+        )
+        if archived:
+            # stderr, not stdout: `--json` promises a parseable stdout, and a real wave
+            # result always carries `trailSlotDir`, so a stdout notice here would prefix
+            # every `--json` run with a non-JSON line.
+            print(f"land-wave: archived {path.name} -> {archived}", file=sys.stderr)
+        params = {"wave_result": payload, "branch": args.branch, "limit": args.limit}
+        if bare_sha:
+            params["shipped_in"] = bare_sha
+        try:
+            reply = _invoke(
+                repo_root, engine_root, "roadmap.blitz_land", params,
+                args.live_engine_tree,
+            )
+        except ValueError as exc:
+            return refuse(f"{path.name}: {exc}")
+
+        # `approved`, `execution_ready` and `closed` are the op's own reply keys, one
+        # per lane of the skill's landing table. They are read separately and never
+        # collapsed: an approval opens a dependent's PLANNING gate, an execution stamp
+        # hands the baton to /execute-plan, and a terminal stamp opens the EXECUTION
+        # gate too. Collapsing them is what makes an all-S wave read as a stall.
+        # A row whose own per-lane flag is False stamped nothing (see `_lane_refusals`), so it
+        # is not counted as one — a total that includes it reports a wave as advancing on
+        # batons that will return as candidates.
+        counted = {
+            lane: sum(
+                1
+                for row in (reply.get(lane) or [])
+                if not _stamped_nothing(lane, row)
+            )
+            for lane in _LANES
+        }
+        for lane, n in counted.items():
+            totals[lane] += n
+
+        # A REJECTED prior is stamped with the landing's SHA and reported only as a key on the
+        # closed row. `close_dispatched` takes `prior or shipped_in or ""`, so where the prior
+        # verifies it correctly wins — but where it does NOT verify, and the landing happens to
+        # carry a `--shipped-in`, the baton is silently stamped with the landing commit instead.
+        # That is the wrong-SHA outcome the caller-side restore exists to avoid, arriving by the
+        # one path the restore cannot prevent, and nothing in the printed summary says so.
+        for line in _rejected_prior_lines(reply):
+            print(line, file=sys.stderr)
+        all_refused.extend(reply.get("refused") or [])
+        all_refused.extend(_lane_refusals(reply))
+        all_surfaced.extend(reply.get("surfaced_to_pm") or [])
+        all_fell_back.extend(_fallback_lines(reply))
+        # Each landing recomputes `next_wave` from a FRESH gate read taken after its
+        # own writes, so the last fire's is the only current one — an earlier fire's
+        # was computed before the later fires had landed anything.
+        next_wave = reply.get("next_wave") or next_wave
+        landings.append(
+            {"fire": path.name, "counted": counted, "reply": reply,
+             "trailDir": result.get("trailDir") or ""}
+        )
+
+    advanced = sum(totals.values())
+    uncommitted = _landing_pathspec(fires, [l["reply"] for l in landings], repo_root)
+    # The declaration written just below is dirty by construction, and the scan above ran before
+    # it existed — so it is named here rather than left for the next landing to find.
+    landing_name = f"wave-{wave_index}.landing.{_landing_slot([l['fire'] for l in landings])}.json"
+    for trail in {Path(l["trailDir"]) for l in landings if l["trailDir"]}:
+        rel = _repo_relative(str(trail / landing_name), repo_root)
+        if rel and trail.is_dir() and rel not in uncommitted:
+            uncommitted = sorted([*uncommitted, rel])
+
+    # The landing's own record, in the trail, BEFORE anything is printed. Without it the only
+    # account of what a wave landed is stdout — which the next session does not have — and the
+    # driver that must subtract pulled and surfaced batons from a fresh gate read has to
+    # reconstruct them from prose across several trail dirs. Measured on project-rag: four trails
+    # carrying no landing result at all. Keyed by the fire set this call landed, so sessions
+    # landing different fires of one wave write different files and never conflict on rebase;
+    # `read_wave_landings` aggregates them.
+    summary = {
+        "waveIndex": wave_index,
+        "totals": totals,
+        "advanced": advanced,
+        "refused": all_refused,
+        "surfacedToPm": all_surfaced,
+        "adjudicated": adjudicated,
+        "fellBack": all_fell_back,
+        "errored": still_errored,
+        "nextWave": next_wave,
+        "landings": [{"fire": l["fire"], "counted": l["counted"]} for l in landings],
+        "uncommitted": uncommitted,
+    }
+    for trail in {Path(l["trailDir"]) for l in landings if l["trailDir"]}:
+        if trail.is_dir():
+            try:
+                (trail / landing_name).write_text(
+                    json.dumps(summary, indent=2), encoding="utf-8", newline="\n"
+                )
+            except OSError as exc:
+                # Never fatal: the landing already wrote to disk through the engine, and losing
+                # the summary must not read as a landing that failed.
+                print(f"land-wave: could not write the landing summary under {trail}: {exc}",
+                      file=sys.stderr)
+
+    if uncommitted and not args.no_commit:
+        committed, uncommitted = _commit_own_records(
+            repo_root, engine_root, uncommitted, wave_index, args.live_engine_tree
+        )
+        if committed:
+            print(f"land-wave: committed {len(committed)} record path(s).", file=sys.stderr)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "waveIndex": wave_index,
+                    "totals": totals,
+                    "advanced": advanced,
+                    "refused": all_refused,
+                    "surfacedToPm": all_surfaced,
+                    "adjudicated": adjudicated,
+                    "fellBack": all_fell_back,
+                    "errored": still_errored,
+                    "nextWave": next_wave,
+                    "landings": [
+                        {"fire": l["fire"], "counted": l["counted"]} for l in landings
+                    ],
+                    "uncommitted": uncommitted,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(f"land-wave: wave {wave_index} — {len(fires)} fire(s) landed")
+        for l in landings:
+            c = l["counted"]
+            print(
+                f"  fire {l['fire']}: approved {c['approved']}, "
+                f"execution_ready {c['execution_ready']}, closed {c['closed']}"
+            )
+        print(
+            f"  WAVE TOTAL: approved {totals['approved']}, "
+            f"execution_ready {totals['execution_ready']}, closed {totals['closed']}"
+        )
+        for entry in all_refused:
+            print(f"  refused  {entry}")
+        for entry in all_surfaced:
+            print(f"  pm       {entry}")
+        if adjudicated:
+            print(f"  adjudicated {adjudicated} PM-bound entr(ies) closed by an agent ruling; not PM-facing")
+        for entry in all_fell_back:
+            print(f"  fellback {entry}")
+        for entry in still_errored:
+            print(f"  errored  {entry['batonId']}: {entry.get('rerunError') or entry.get('opError')}")
+        if next_wave:
+            print(f"  next     wave {next_wave.get('waveIndex')}: "
+                  f"{len(next_wave.get('batons') or [])} baton(s)")
+
+    if uncommitted and not args.json:
+        # Printed before either STOP: a refused or opened-nothing landing can still have
+        # written records, and what the fire wrote is uncommitted either way.
+        print(
+            f"\nland-wave: {len(uncommitted)} path(s) this wave's own records name are "
+            "uncommitted. Commit them BY NAME \u2014 the landing does not, and the next emit "
+            "HOLDS a baton whose record is dirty as if a live writer were still on it:"
+        )
+        for path in uncommitted:
+            print(f"    {path}")
+
+    if all_refused:
+        print(
+            "\nland-wave: STOP — a landing returned refusals. A refusal is the op declining "
+            "to write something misleading; it is never a thing to route around.",
+            file=sys.stderr,
+        )
+        return EXIT_LANDING_REFUSALS
+
+    if still_errored:
+        print(
+            f"\nland-wave: STOP — {len(still_errored)} entr(ies) are still errored: "
+            "plan.readiness_verdict failed and the review set is preserved. Fix the op failure, "
+            "then re-run `land-wave --errored-only <the archived fire result>`. Never re-fire "
+            "the wave: it re-reviews plans the reviewers already passed.",
+            file=sys.stderr,
+        )
+        return EXIT_ERRORED
+
+    if advanced == 0:
+        print(
+            f"\nland-wave: STOP — wave {wave_index} opened nothing across all "
+            f"{len(fires)} fire(s) (approved 0, execution_ready 0, closed 0). The next "
+            "wave is this wave again; report rather than spinning.",
+            file=sys.stderr,
+        )
+        return EXIT_WAVE_OPENED_NOTHING
+
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

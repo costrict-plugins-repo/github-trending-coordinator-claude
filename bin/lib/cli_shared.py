@@ -1,0 +1,444 @@
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+
+_LIB_DIR = os.path.dirname(os.path.abspath(__file__))
+if _LIB_DIR not in sys.path:
+    sys.path.insert(0, _LIB_DIR)
+
+from coordinator_registry import em_id_for_root  # noqa: E402
+from machine_local_impl_resolve import (  # noqa: E402
+    claude_home as _mlir_claude_home,
+    machine_local_impl_path as _mlir_machine_local_impl_path,
+)
+from repo_identity import resolve_checked_repo_root  # noqa: E402
+
+
+MACHINE_LOCAL_IMPL_ENV = "MACHINE_LOCAL_IMPL"
+CLAUDE_HOME_ENV = "CLAUDE_HOME"
+
+# C23 AC13-style bootstrap carve-out (named exception, mirrors
+# coordinator/bin/lib/cc_invoke.py's own AC13 note) -- this constant and
+# claude_klabauter_root() below are NOT routed through
+# coordinator_core.engine_root.coordinator_engine_root_env. This module is
+# DoE-resident CLI plumbing (see module docstring) consumed by the legacy
+# State-1 CLIs (coordinator-queue-append, coordinator-lesson-promote,
+# coordinator-harvest-deferrals, regen-cockpit-schema, klabauter-channel) --
+# scripts that must keep working in an environment where `coordinator_core`
+# is not yet pip-installed and is not necessarily on `sys.path` (the
+# published-mirror/State-1-fallback case DR-210 requires stays live
+# indefinitely). `claude_klabauter_root()` IS the primitive those callers use to find
+# where `coordinator_core` even lives; importing the accessor here would be
+# the same chicken-and-egg `cc_invoke.py`'s own AC13 rung exists to avoid.
+# PRECEDENCE HERE DELIBERATELY DIVERGES FROM THE ACCESSOR, AND SAYING SO IS
+# THE POINT. `coordinator_engine_root_env` reads the retired name only to
+# report it as retired and NEVER returns it (C14). This site still ANSWERS
+# from it when the new name is unset. That is not the same rule, and a
+# hand-duplicate that claims parity it does not have is worse than no
+# duplicate -- the two would disagree only in the skew case nobody exercises
+# until it breaks on the commit hot path.
+#
+# Why the divergence is kept: this is the primitive the State-1 fallback CLIs
+# use to locate `coordinator_core` at all. Dropping the retired rung here
+# cannot degrade to a slower path, only to a dead one, and DR-210 keeps that
+# fallback live indefinitely. Every in-tree exporter now sets BOTH names
+# (scripts/setup.py x2, append-goal-event, regen-cockpit-schema, cc_invoke
+# exports the new name only), so this rung should already be unreachable in
+# practice.
+#
+# CONDITION FOR REMOVING IT -- already met, not a future measurement:
+# C14 item 4 (this rung) was discharged at `02ef8ae9de77` on C23's
+# three-leg ratchet -- zero unexcluded executable read sites, proved as a
+# property of the code by falsification against planted tuple/list/dict
+# shapes. `coordinator_core.engine_root_census.census()` no longer reports
+# a verdict field at all (that field, `evidences_absence`, was removed as
+# part of the same cleanup) -- it reports fallback-read observations only,
+# and no future census reading can discharge this or anything else. Do not
+# wait on a census result before deleting this rung; the discharge already
+# happened.
+COORDINATOR_ENGINE_ROOT_ENV = "COORDINATOR_ENGINE_ROOT"
+CLAUDE_KLABAUTER_ROOT_ENV = "CLAUDE_KLABAUTER_ROOT"
+
+UNDER_TEST_ENV = "PYTEST_CURRENT_TEST"
+
+_ISOLATION_ROOT_WARNED: set[str] = set()
+
+COLLISION_RETRY_CAP = 1000
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def managed_temp_root(repo_root=None) -> str:
+    """Created managed Temp dir: ``<tmp>/coordinator/<repo name>`` or ``<tmp>/coordinator/_fleet``.
+
+    Stdlib mirror of ``coordinator_core.temp_layout.managed_tempdir``; pinned equal by
+    ``tests/test_cli_shared_managed_temp_root.py``.
+    """
+    root = os.path.join(tempfile.gettempdir(), "coordinator")
+    if repo_root is None:
+        leaf = "_fleet"
+    else:
+        leaf = os.path.basename(os.fspath(repo_root).rstrip("\\/"))
+        if not leaf:
+            raise ValueError(f"repo_root has no directory name: {repo_root!r}")
+        if leaf == "_fleet":
+            raise ValueError("repo directory name '_fleet' is reserved for host-scoped Temp")
+    path = os.path.join(root, leaf)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _is_swept_tmp_root(path: str) -> bool:
+    try:
+        real = os.path.realpath(path)
+        tmp = os.path.realpath(tempfile.gettempdir())
+    except OSError:
+        return False
+    under_tmp = real == tmp or real.startswith(tmp + os.sep)
+    return under_tmp and not os.path.isdir(path)
+
+
+def _refuse_swept_isolation_root(env_var: str, value: str, caller_name: str) -> None:
+    print(
+        f"error: {caller_name}: refusing to write under {env_var}={value!r} — "
+        f"this test-isolation root resolves under the system temp directory "
+        f"and no longer exists (a swept pytest tmp_path, inherited by a "
+        f"long-lived process). Writing here would recreate the directory and "
+        f"silently lose the entry nobody will ever look under it. Restart the "
+        f"process that holds this env var, or unset {env_var} before invoking "
+        f"{caller_name} outside a test.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def isolation_root_if_under_test(env_var: str, *, caller_name: str) -> str | None:
+    """The value of test-isolation write-root override `env_var`, but only
+    when this process is actually running under a test.
+
+    Negative spec: these overrides (`QUEUE_APPEND_OUTPUT_ROOT`,
+    `LESSON_PROMOTE_OUTBOX_ROOT`) are a property of a CALLING process that
+    redirects its own writes into a tmpdir. Nothing confined them to one.
+    An interactive session that inherits one -- from a shell descended from a
+    test run, or from a warm engine spawned by one -- silently redirects every
+    subsequent queue write into a swept temp directory while the CLI prints a
+    plausible path and exits 0. Measured 2026-08-31: real improvement-queue
+    entries landed in `Temp/harvest-test-*/state/improvement-queue/` from a
+    live session, twice, with the filer holding a success receipt
+    (state/bug-backlog/2026-08-31-coordinator-queue-append-writes-into-a-s-1236db3da983.yaml).
+    For a queue whose whole job is not losing items, a silent misroute is the
+    worst available failure.
+
+    `coordinator_core.ops.queue_append._output_root_override` closes the same
+    hole on the warm-server route by refusing the read off-process; this closes
+    it on the CLI route, which reaches the legacy in-process write instead and
+    had no gate at all.
+
+    Never a raise, and never silent: an override that cannot be honoured is
+    dropped with a stderr line naming it, and the write lands where it should
+    have all along.
+    """
+    value = (os.environ.get(env_var) or "").strip()
+    if not value:
+        return None
+    if os.environ.get(UNDER_TEST_ENV):
+        if _is_swept_tmp_root(value):
+            _refuse_swept_isolation_root(env_var, value, caller_name)
+        return value
+    if env_var not in _ISOLATION_ROOT_WARNED:
+        _ISOLATION_ROOT_WARNED.add(env_var)
+        print(
+            f"{caller_name}: ignoring inherited {env_var}={value} — a test-isolation "
+            f"redirect outside a test run. Writing to the resolved repo path instead.",
+            file=sys.stderr,
+        )
+    return None
+
+
+def claude_home() -> str:
+    """Return the ~/.claude root, honouring CLAUDE_HOME env var for test isolation.
+
+    Delegates to machine_local_impl_resolve.claude_home() (settings-home-first
+    resolution now lives there, shared across every former hand-roll of this
+    join — see that module's docstring).
+    """
+    return _mlir_claude_home()
+
+
+def machine_local_impl() -> str:
+    """Return the path to _machine_local.py, settings-home first, honouring
+    MACHINE_LOCAL_IMPL for tests.
+
+    Delegates to machine_local_impl_resolve.machine_local_impl_path() — DR-210
+    Amendment 2026-07-24 ("resolves nothing through ~/.claude/bin"): this rung
+    now tries settings-home before the retired compat mirror.
+    """
+    return _mlir_machine_local_impl_path(MACHINE_LOCAL_IMPL_ENV)
+
+
+def resolve_python() -> str:
+    return sys.executable
+
+
+def _load_machine_local_kernel():
+    """Load `_machine_local.py`'s module object by its own resolved path
+    (`machine_local_impl()` -- settings-home first, DR-210 Amendment) and
+    return it, in-process, no interpreter spawn.
+
+    Spec: docs/plans/2026-09-11-a-python-process-does-not-spawn-a-python-process.md
+    (P055-C3). The resolved path is the identical file the pre-conversion
+    code spawned `python <impl> ...` against -- importing it in-process
+    trades the interpreter spawn for a module load of the SAME file,
+    introducing no new which-tree ambiguity (the path resolution itself is
+    unchanged). Not cached module-to-module: each call re-resolves
+    `machine_local_impl()` first, matching the pre-conversion per-call
+    resolution, then loads fresh via `importlib` (cheap: one file, no
+    heavy transitive imports) so a test's `MACHINE_LOCAL_IMPL` override
+    between calls is honoured exactly as the spawn form was.
+    """
+    import importlib.util
+
+    impl = machine_local_impl()
+    spec = importlib.util.spec_from_file_location("_machine_local_kernel", impl)
+    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod
+
+
+def machine_local_get(key: str) -> str | None:
+    try:
+        mod = _load_machine_local_kernel()
+        rc, val = mod.resolve_one(key, layers=None)
+    except (SystemExit, Exception):
+        return None
+    if rc == mod.EXIT_OK and val:
+        return val
+    return None
+
+
+def machine_local_dump_repos() -> dict[str, str]:
+    """Resolve every repos.* key in one in-process kernel call (the batch
+    counterpart to enumerate-then-get). `resolve_one` is the same kernel
+    `get` uses, so a batched value is byte-identical to what a per-key
+    `get` would print — see _machine_local.py::cmd_dump docstring.
+    Returns {} on any load/resolution failure OR when any key hits an
+    OPERATIONAL failure (matches machine_local_get's fail-closed contract —
+    a partial/crashed dump is not a value to trust); callers already
+    tolerate an empty/partial paths table.
+    """
+    try:
+        mod = _load_machine_local_kernel()
+        reg_dir = mod._registry_dir()
+        layers = mod._build_resolution_layers(reg_dir)
+        all_keys = [k for k in mod._all_keys(layers) if k == "repos" or k.startswith("repos.")]
+        values: dict[str, object] = {}
+        for k in all_keys:
+            rc, val = mod.resolve_one(k, layers)
+            if rc == mod.EXIT_OK and val is not None:
+                values[k] = val
+            elif rc == mod.EXIT_OPERATIONAL:
+                return {}
+    except (SystemExit, Exception):
+        return {}
+    return {k: v for k, v in values.items() if isinstance(v, str) and v}
+
+
+def machine_local_repos_keys() -> list[str]:
+    try:
+        mod = _load_machine_local_kernel()
+        reg_dir = mod._registry_dir()
+        layers = mod._build_resolution_layers(reg_dir)
+        all_keys = mod._all_keys(layers)
+    except (SystemExit, Exception):
+        return []
+    return [k for k in all_keys if k.startswith("repos.")]
+
+
+def claude_klabauter_root() -> str | None:
+    """Resolve the claude-klabauter repo root, mirroring coordinator-claude-klabauter-root.sh (AC1).
+
+    Resolution chain:
+      1. COORDINATOR_ENGINE_ROOT env var — if non-empty, trusted as-is (§4b
+         idempotency gate). CLAUDE_KLABAUTER_ROOT is read too, but ONLY as a fallback
+         when the new name is unset — C14 closed coordinator_engine_root_env's
+         dual-read window, and this bootstrap-carve-out site (see the
+         CLAUDE_KLABAUTER_ROOT_ENV declaration above) duplicates that same precedence by
+         hand rather than importing the accessor.
+
+         C23: fixed a dark bug here -- this rung previously read ONLY
+         CLAUDE_KLABAUTER_ROOT_ENV, so a caller that had migrated to
+         COORDINATOR_ENGINE_ROOT (and never set the retired name) got NO
+         override rung at all and silently fell through to rung 2.
+      2. machine-local get repos.claude_klabauter — delegates to the §4c discovery ladder.
+      3. Returns None when unresolvable — callers degrade gracefully (AC13).
+
+    Negative-spec: never raises; returns None when unresolvable so callers can emit
+    WARN + skip. The low-level shell primitive coordinator-claude-klabauter-root.sh hard-errors;
+    this is the Python caller-layer resilience wrapper.
+
+    Spec backlink: pln-stop-the-rot-claude-klabauter-state-home-placement-4cc787 § AC1 / AC13
+    """
+    override = os.environ.get(COORDINATOR_ENGINE_ROOT_ENV, "").strip()
+    if not override:
+        override = os.environ.get(CLAUDE_KLABAUTER_ROOT_ENV, "").strip()
+    if override:
+        return override
+    val = machine_local_get("repos.claude_klabauter")
+    return val if val else None
+
+
+def resolve_from_repo(root: str | None = None) -> str:
+    """Identify the from_repo/EM identity for a queue/outbox entry from cwd context.
+
+    Resolution order (same convention as cross-repo-memo._sender_em_id):
+      1. cwd git-root -> reverse-lookup against machine-local repos.* table
+      2. repos.content_root (the coordinator content repo) -> "claude-central-em"
+      3. Unregistered git repo -> basename of git root + "-em"
+      4. Not in a git repo -> "unknown-sender-em"
+      Never uses `git remote get-url origin` — that yields a URL, not a shortname.
+
+    Accepts a pre-resolved repo root to avoid spawning a second git-root
+    resolution when the caller already holds it (coordinator-lesson-promote's
+    F3 hoist). Pass None (default) to resolve internally via the checked
+    resolver (`repo_identity.resolve_checked_repo_root`).
+
+    Classification: READER (AC10). On MISMATCH — positive evidence the cwd
+    names a DIFFERENT real repo than the harness anchor — warns to stderr and
+    proceeds with the resolved root anyway (identity attribution, not a
+    destructive action); per DR-277
+    (docs/decisions/DR-277-guards-are-advisory-by-default-two-named.md).
+    UNRESOLVED never refuses either, degrading to `root=None` exactly as the
+    predecessor's git-failure branch did.
+
+    Ensures repos.content_root is present in the paths table for the central-identity
+    anchor even when machine_local_repos_keys() omits it (e.g. unregistered machine).
+    """
+    if root is None:
+        root, verdict = resolve_checked_repo_root(explicit_root=None)
+        if verdict.get("verdict") == "MISMATCH":
+            print(
+                verdict.get("message", "cli_shared: repo-identity MISMATCH"),
+                file=sys.stderr,
+            )
+    paths = machine_local_dump_repos()
+    paths.setdefault("repos.content_root", machine_local_get("repos.content_root"))
+    return em_id_for_root(root, {k: v for k, v in paths.items() if v})
+
+
+def write_path_excl(out_path: str, content: str, *, caller_name: str) -> str:
+    """Write content to out_path using an exclusive-create + retry-with-suffix loop.
+
+    Replaces a plain os.replace()/open("w") silent overwrite with os.O_CREAT|O_EXCL
+    so a same-key collision from a concurrent second write does NOT destroy the
+    first entry. On FileExistsError, retries with an incrementing filename suffix
+    inserted before the extension (<stem>-2<ext>, -3<ext>, ...) bounded to
+    COLLISION_RETRY_CAP attempts, so both entries persist under distinct filenames.
+    Only when the cap is exhausted does this raise — fail loud, never silently
+    drop the entry.
+
+    caller_name is interpolated into the exhausted-retry error message so an
+    operator debugging a stuck write knows which CLI produced it — the one bit
+    of per-caller distinction preserved by this consolidation (do NOT flatten
+    to one generic string).
+
+    Returns the actual path written (== out_path unless a collision suffix was used).
+
+    Negative-spec: do NOT swap this for a plain os.replace()/open("w") — that
+    silently clobbers a same-key concurrent write. Do NOT swap this for a bare
+    fail-loud FileExistsError (the cross-repo-memo shape) either — callers of
+    this helper are terminal writers with no retry path of their own, so failing
+    loud on the FIRST collision would drop the entry rather than preserve it;
+    retry-with-suffix is required.
+
+    Counter-pattern (deliberate divergence): coordinator/bin/cross-repo-memo.py's
+    _write_file FAILS LOUD (FileExistsError, no retry) on collision because its
+    caller is interactive and retries with a new --topic.
+
+    Spec backlink: F1/F2 legacy-fallback silent-overwrite collision guard (chunk C1).
+    """
+    root, ext = os.path.splitext(out_path)
+    candidate = out_path
+    attempt = 1
+    while True:
+        try:
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            attempt += 1
+            if attempt > COLLISION_RETRY_CAP:
+                raise FileExistsError(
+                    f"{caller_name}: refusing to drop entry — exhausted "
+                    f"{COLLISION_RETRY_CAP} collision-retry attempts for base path "
+                    f"{out_path!r}. All candidate filenames already exist. "
+                    f"Tried {out_path!r} through {root!r}-{COLLISION_RETRY_CAP}{ext!r}."
+                ) from None
+            candidate = f"{root}-{attempt}{ext}"
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+        return candidate
+
+#: Repo-relative parts to the engine build stamp, mirroring
+#: `coordinator_core.ipc._ENGINE_STAMP_RELATIVE_PARTS` /
+#: `coordinator/bin/tests/engine_stamp_probe.py::_STAMP_PARTS`. Restated
+#: rather than imported: this module is the State-1 fallback CLI plumbing
+#: (see module docstring) that must keep working when `coordinator_core` is
+#: not importable, so it cannot depend on the package to ask whether a root
+#: IS that package's published build.
+_ENGINE_STAMP_RELATIVE_PARTS = ("coordinator_core", "_engine_stamp")
+
+
+def _is_stamped_published_root(root: str) -> bool:
+    """True if `root` carries the engine build stamp — the mark of a
+    PUBLISHED engine mirror (e.g. Claude-klabauter), never a source
+    authoring checkout. A stamped root's `state/` is gitignored there
+    (percolate excludes it from the publish payload), so a data write
+    routed there is silently lost.
+    """
+    try:
+        return os.path.getsize(os.path.join(root, *_ENGINE_STAMP_RELATIVE_PARTS)) > 0
+    except OSError:
+        return False
+
+
+def claude_klabauter_data_home() -> str | None:
+    """Resolve the claude-klabauter STATE/DATA home -- where `state/` writes belong --
+    as distinct from `claude_klabauter_root()`, the engine CODE root.
+
+    The engine-root env override names where engine code runs from, which is
+    the published mirror on a standard install; that mirror's `state/` is
+    gitignored, so a data write there is accepted and lost. Precedence matches
+    the native write seam (`coordinator_core.ops.queue_append._claude_klabauter_root`)
+    so a dedup scan and the write it dedups always resolve the same root:
+
+      1. COORDINATOR_ENGINE_ROOT / CLAUDE_KLABAUTER_ROOT, unless it carries the engine
+         build stamp (a published mirror).
+      2. `machine-local get repos.claude_klabauter`, likewise never a mirror.
+      3. None -- callers degrade gracefully (WARN + skip).
+
+    Never raises; no subprocess spawn beyond `machine_local_get`'s own.
+    """
+    override = os.environ.get(COORDINATOR_ENGINE_ROOT_ENV, "").strip()
+    if not override:
+        override = os.environ.get(CLAUDE_KLABAUTER_ROOT_ENV, "").strip()
+    if override and not _is_stamped_published_root(override):
+        return override
+    val = machine_local_get("repos.claude_klabauter")
+    if val and not _is_stamped_published_root(val):
+        return val
+    return None
+
+
+# Dual-read window for the engine-root rename (docs/plans/2026-08-20-an-engine-
+# root-is-not-named-for-the-repo.md), same class as cc_invoke's alias and found
+# by the same mechanism. The PUBLISHED engine and its CLIs are transformed on the
+# way out -- every `claude-klabauter` identifier becomes `claude_klabauter` -- but a
+# published CLI still imports THIS module from the live tree, which is not
+# transformed. So it asks for `claude_klabauter_root` and finds only `claude_klabauter_root`, and dies on
+# ImportError in whatever ceremony happens to call it rather than in any test.
+# In the mirror this line transforms into a self-assignment: a harmless no-op.
+# Remove it only once no published CLI references the old spelling.
+claude_klabauter_root = claude_klabauter_root

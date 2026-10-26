@@ -1,0 +1,153 @@
+# Unix shebang — was generator-owned by gen-launcher-shim.py --ensure-unix; that mode was retired 2026-07-28 (POSIX-EXEC-ASSUMPTION-GUARD, PM ruling) and no longer regenerates this line.
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+
+_TRANSPORT_FAIL = 3
+
+
+def _import_ops():
+    import lib  # noqa: F401 — bootstraps coordinator/bin/lib onto sys.path
+    from cc_invoke import require_dispatch_engine_on_path
+
+    claude_klabauter_root = require_dispatch_engine_on_path()
+    from coordinator_core.ops.read_frontmatter_field import read_frontmatter_field
+
+    return read_frontmatter_field
+
+
+def resolve_origin_handoff_id(read_frontmatter_field, origin_handoff: str | None) -> str:
+    """C2 ID-companion resolve: `handoff_id` off the SAME file `origin_handoff` names.
+
+    Emits empty string (never a different artifact's id) when `origin_handoff` is
+    unset or does not exist on disk — mirrors the oracle's
+    `[ -n "${ORIGIN_HANDOFF:-}" ] && [ -f "${ORIGIN_HANDOFF}" ]` guard.
+    """
+    if origin_handoff and os.path.isfile(origin_handoff):
+        return read_frontmatter_field(origin_handoff, "handoff_id")
+    return ""
+
+
+def extract_scope_paths(handoff_text: str) -> list[str]:
+    found = False
+    paths: list[str] = []
+    for line in handoff_text.splitlines():
+        if line.startswith("scope:"):
+            found = True
+            continue
+        if found and line.startswith("  - "):
+            paths.append(line[4:])
+            continue
+        if found and line[:1].islower():
+            break
+    return paths
+
+
+def _cmd_resolve_origin_handoff_id(args: argparse.Namespace, read_frontmatter_field) -> int:
+    origin_handoff_id = resolve_origin_handoff_id(read_frontmatter_field, args.origin_handoff)
+    print(f"ORIGIN_HANDOFF_ID={origin_handoff_id}")
+    return 0
+
+
+def _cmd_commit_scope(args: argparse.Namespace, _read_frontmatter_field) -> int:
+    handoff = args.handoff
+    read_path = (
+        os.path.join(args.cwd, handoff) if args.cwd and not os.path.isabs(handoff) else handoff
+    )
+    try:
+        with open(read_path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError as exc:
+        print(f"FAIL: cannot read handoff '{read_path}': {exc}", file=sys.stderr)
+        return 1
+
+    scope = extract_scope_paths(text)
+    if not scope:
+        print(
+            "FAIL: handoff frontmatter scope: block missing or empty — cannot enumerate paths",
+            file=sys.stderr,
+        )
+        return 1
+
+    paths = scope + [handoff]
+    message = f"chore(spinoff): {args.slug} [authored mid-session]"
+
+    if args.dry_run:
+        print("git add -- " + " ".join(paths))
+        print(f"git commit -m {message!r} -- " + " ".join(paths))
+        return 0
+
+    from cc_invoke import _no_console_passthrough_kw, _resolve_claude_klabauter_root
+
+    add_proc = subprocess.run(
+        ["git", "add", "--"] + paths,
+        cwd=args.cwd,
+        **_no_console_passthrough_kw(_resolve_claude_klabauter_root()),
+    )
+    if add_proc.returncode != 0:
+        return add_proc.returncode
+
+    commit_proc = subprocess.run(
+        ["git", "commit", "-m", message, "--"] + paths,
+        cwd=args.cwd,
+        **_no_console_passthrough_kw(_resolve_claude_klabauter_root()),
+    )
+    return commit_proc.returncode
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="spinoff-deliverable-and-commit.py",
+        description="origin-handoff-id carry + scope-scoped commit for /spinoff",
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+
+    origin_parser = subparsers.add_parser(
+        "resolve-origin-handoff-id",
+        help="resolve origin_handoff_id (handoff_id off the origin_handoff file)",
+    )
+    origin_parser.add_argument(
+        "--origin-handoff",
+        default="",
+        help="path to the active pickup baton this session was opened with (optional)",
+    )
+
+    commit_parser = subparsers.add_parser(
+        "commit-scope",
+        help="extract handoff frontmatter scope: paths and scoped-commit them plus the handoff itself",
+    )
+    commit_parser.add_argument("--handoff", required=True, help="path to the just-written spinoff handoff")
+    commit_parser.add_argument("--slug", required=True, help="the spinoff slug, used in the commit subject")
+    commit_parser.add_argument(
+        "--cwd", default=None, help="repo root to run git in (default: current working directory)"
+    )
+    commit_parser.add_argument(
+        "--dry-run", action="store_true", help="print the git commands instead of running them"
+    )
+
+    args = parser.parse_args(argv)
+
+    try:
+        read_frontmatter_field = _import_ops()
+    except RuntimeError as exc:
+        print(f"spinoff-deliverable-and-commit.py: CLAUDE_KLABAUTER_ROOT resolution failed: {exc}", file=sys.stderr)
+        return _TRANSPORT_FAIL
+    except ImportError as exc:
+        print(f"spinoff-deliverable-and-commit.py: coordinator_core ops not importable: {exc}", file=sys.stderr)
+        return _TRANSPORT_FAIL
+
+    if args.subcommand == "resolve-origin-handoff-id":
+        return _cmd_resolve_origin_handoff_id(args, read_frontmatter_field)
+    if args.subcommand == "commit-scope":
+        return _cmd_commit_scope(args, read_frontmatter_field)
+
+    parser.print_usage(sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

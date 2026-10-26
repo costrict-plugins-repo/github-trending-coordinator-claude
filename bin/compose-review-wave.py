@@ -1,0 +1,1017 @@
+"""compose-review-wave.py -- caller-side composer for the fired review
+partition workflow.
+
+Ported from the coordinator content repo's coordinator/bin/compose-review-wave.py
+(docs/plans/2026-09-18-doe-holds-no-scripts.md, chunk W2-C10). Measured cold
+on this box (`python3 coordinator/bin/compose-review-wave.py --help`, real
+subprocess, three runs): ~58-61ms end-to-end, comfortably inside the 200ms
+"move under the batch rules" line (well inside the 500ms kill bar) -- moved,
+not rewritten. See state/audits/doe-script-arrivals/W2-C10.yaml for the
+figures.
+
+Spec backlink: docs/plans/2026-08-18-fire-the-review-partition-as-a-workflow.md,
+chunk C1. `coordinator/docs/wiki/workflow-emitter-contract.md` (content repo)
+§5 pins a four-part payload on every Workflow-emit agent-call. A Workflow
+`agent()` spawn is not an `Agent`-tool call, so `coordinator/hooks/scripts/
+enforce-agent-dispatch-mode.py`'s (content repo) PreToolUse catering never
+fires on it. This script is the caller-side reconstruction of the three
+parts a composer CAN close (i, ii, iv) -- part (iii), the permission-mode
+requirement, is a settled unclosable residual on this path (§6) and is
+recorded, not resolved, here.
+
+Sibling to coordinator/workflows/wsc-review-partition.mjs (content repo, C2):
+this script produces exactly the `args` object that Workflow script consumes
+-- `{ slices: [ { id, diffPath, shaRange, wasteReport,
+reviewer: {sidecarPath, contractBlocks} } ] }`,
+no other top-level or per-role key. The integrator stage is retired
+(docs/plans/2026-09-26-retire-review-integrator.md D9b) -- the reviewer
+applies its own findings, so no second per-slice role is provisioned or
+emitted. `wasteReport` is a repo-relative path to
+the slice's attributed waste report, added by
+docs/plans/2026-08-28-waste-number-reaches-the-reviewer.md chunk C3 -- one
+key added through the existing shape, never a restructuring of it (see
+`_run_waste_attribution`/`_write_waste_report` below).
+
+INVERTS the hook's fail-open posture, deliberately. The hook fails open on
+a missing contract block because a missing block must never block a spawn
+that is already happening; this composer runs BEFORE the spawn, so a
+missing block here means the fired reviewer would arrive uncatered --
+every failure leg below exits non-zero with a named stderr precondition
+instead of degrading silently. Two of the hook's own tolerances do NOT
+carry over for the same reason: no `timeout=2` on the provision_report
+subprocess call (a cold interpreter start on this box will not reliably
+land inside that budget, and this script has no dispatch deadline to
+race), and the engine-root/PYTHONPATH resolution leg is resolved
+explicitly, with the NAMED precondition `coordinator_core unreachable`
+distinguishable on stderr from a missing-contract-block failure -- the
+operator remedy for each differs.
+
+Resolves catering parts (i) resolved contract_blocks prose and (ii) the
+pre-allocated run-report sidecar path LIVE, via one
+`python -m coordinator_core.subagent_sandbox.provision_report` subprocess
+per phase -- the same invocation shape the dispatch hook already uses,
+with an explicit `--policy` flag and a stdin payload carrying top-level
+`agent_type`, `provision_key`, and `contract_blocks`. Part (iv), the
+resolved role-framing prose (`snippets/agent-role-dispatched.md`, verbatim,
+unconditional, no roster lookup), has no roster to resolve against and is
+appended directly by this script, not via provision_report.
+
+PATH RESOLUTION -- doctrine assets, plugin root, never `Path(__file__)`.
+`subagent-sandbox-policy.yaml` and `snippets/agent-role-dispatched.md` are
+DoE-side doctrine assets: they stay in the content repo and are published, so
+they are never at a fixed offset from this file's own location once this
+CLI lands here in the engine repo (docs/plans/2026-09-18-doe-holds-no-scripts.md §
+Path resolution). Both default paths resolve through the plugin root
+(`coordinator_core.subagent_sandbox.provision_report.resolve_plugin_root`),
+mirroring `check-gitignore-template-drift.py`'s own `_default_template_path`.
+`--policy` still overrides explicitly, for a caller that already knows
+where the policy lives (e.g. a test fixture); the role-append snippet has
+no CLI override in the DoE original and keeps none here.
+
+`provision_key` is `wsc-<run-id>.<slice-id>.<role>` -- deterministic (given
+the same `--run-id`, a re-run returns the same path rather than clobbering)
+and slice-bearing (N concurrent same-type sidecars are distinguishable by
+filename alone). `--run-id` is a REQUIRED argument, not a wall-clock
+default: minting a fresh timestamp on every invocation would make a
+same-manifest re-run non-idempotent by construction. The caller (the
+`/workstream-complete` ceremony, or a test) mints one run-id once and
+reuses it across every composer invocation for that run.
+
+Contract-block names come from `contract_blocks:` in the policy file, read
+with a real `yaml.safe_load` -- never a hardcoded list or count.
+
+Windows-first: `subprocess.run` with an argv list, `shell=False` throughout
+-- `waste-signal.py`'s attribution child is spawned via `python_interp.python_argv`,
+never a bare interpreter name. Diff-freezing no longer spawns at all:
+`_freeze_slices_batch` calls `coordinator_core.ops.review_freeze_diff.
+freeze_diffs_batch` in-process, once per compose() call, for every slice
+lacking a pre-frozen `diffPath` -- see that function's own docstring for the
+single-git-spawn-per-phase batching this replaces the one-CLI-spawn-per-slice
+shape with. `pathlib` throughout; every path in the emitted JSON is
+repo-relative.
+
+CLI:
+    python coordinator/bin/compose-review-wave.py \\
+        --manifest <path-to-slice-manifest.json> \\
+        --run-id <YYYYMMDD-HHMMSS>
+        [--policy <path-to-subagent-sandbox-policy.yaml>]
+        [--engine-root-override <path>]
+
+Manifest shape (JSON):
+    { "slices": [ { "id": "<slice-id>", "diffPath": "<repo-relative-path>" }
+                   | { "id": "<slice-id>", "range": "<git-range>" }, ... ],
+      "plans": [ "<repo-relative-plan-path>", ... ] }
+
+`plans` is optional. Each plan's PM brief is rendered reviewer-framed and
+appended to every slice's REVIEWER `contractBlocks` after the role framing.
+With no `plans` key or an empty list, the line "No plan PM brief was
+supplied for this review." is appended instead. A listed plan that resolves
+no brief is a `ComposeError`.
+
+A slice entry carries EITHER a pre-frozen `diffPath` (passed through
+verbatim) OR a `range`, which this script freezes itself by delegating to
+the installed `freeze-review-diff` CLI -- never by reimplementing it.
+
+Output on stdout: ONE JSON object, the literal `args` payload for C2's
+`wsc-review-partition.mjs` script.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import tempfile
+import sys
+from pathlib import Path, PurePosixPath
+from typing import Any, Optional
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_COORDINATOR_ROOT = _SCRIPT_DIR.parent
+_REPO_ROOT = _COORDINATOR_ROOT.parent
+_WASTE_SIGNAL_SCRIPT = _SCRIPT_DIR / "waste-signal.py"
+
+#: Declared-absence line appended to the reviewer's contractBlocks when the
+#: manifest carries no `plans` key, or an empty one -- a plan-less review is
+#: not a failure, but the absence must be visible, never silent.
+_NO_PLAN_BRIEF_LINE = "No plan PM brief was supplied for this review."
+
+#: Wall-clock ceiling for one slice's attribution child. Generous relative to a
+#: normal covering-test run; it exists to bound a HANG, not to police slow tests.
+_WASTE_ATTRIBUTION_TIMEOUT_S = 600
+
+
+def _call_bounded(label: str, fn, *args, **kwargs):
+    """Run `fn` on a daemon thread and raise ComposeError past `_WASTE_ATTRIBUTION_TIMEOUT_S`.
+
+    The in-process replacement for the subprocess `timeout=` backstop: a hung call is
+    abandoned (the daemon thread dies with the process) and the compose fails loud."""
+    import threading
+
+    box: dict[str, Any] = {}
+
+    def _target() -> None:
+        try:
+            box["value"] = fn(*args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 -- re-raised on the caller's thread
+            box["error"] = exc
+
+    worker = threading.Thread(target=_target, daemon=True)
+    worker.start()
+    worker.join(_WASTE_ATTRIBUTION_TIMEOUT_S)
+    if worker.is_alive():
+        raise ComposeError(f"{label} exceeded {_WASTE_ATTRIBUTION_TIMEOUT_S}s")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def _require_dispatch_engine() -> str:
+    """Put the DISPATCH engine root on `sys.path` and return it, fail-loud.
+
+    Re-resolved on every call, never cached at import time -- see module
+    docstring's own resolution notes; the same discipline the DoE original's
+    `_resolve_claude_klabauter_root` carried, now via the shared `cc_invoke` seam
+    (docs/plans/2026-09-18-doe-holds-no-scripts.md, this repo's own
+    collapse target for the ~200-CLI inline bootstrap preamble).
+    """
+    import lib  # noqa: F401 -- bootstraps coordinator/bin/lib onto sys.path
+
+    from cc_invoke import require_dispatch_engine_on_path
+
+    return require_dispatch_engine_on_path()
+
+
+def _default_policy_path() -> Optional[Path]:
+    """Resolve `subagent-sandbox-policy.yaml` through the coordinator-claude
+    plugin root -- never `Path(__file__)`. See module docstring § PATH
+    RESOLUTION. Returns None when the plugin root cannot be resolved."""
+    _require_dispatch_engine()
+    from coordinator_core.subagent_sandbox.provision_report import resolve_plugin_root
+
+    root = resolve_plugin_root()
+    if root is None:
+        return None
+    return Path(root) / "subagent-sandbox-policy.yaml"
+
+
+def _role_snippet_path() -> Optional[Path]:
+    """Resolve `snippets/agent-role-dispatched.md` through the plugin root --
+    same doctrine-asset class and resolution ladder as `_default_policy_path`.
+    No CLI override, matching the DoE original."""
+    _require_dispatch_engine()
+    from coordinator_core.subagent_sandbox.provision_report import resolve_plugin_root
+
+    root = resolve_plugin_root()
+    if root is None:
+        return None
+    return Path(root) / "snippets" / "agent-role-dispatched.md"
+
+
+#: role -> subagent_type, the one phase every slice gets. The integrator
+#: phase is retired (docs/plans/2026-09-26-retire-review-integrator.md D9b):
+#: the reviewer applies its own findings, so there is no second role here.
+_ROLE_AGENT_TYPE = {
+    "reviewer": "coordinator:code-reviewer",
+}
+
+#: The exact per-slice key set this composer emits -- pinned against C2's
+#: consumed shape (see this script's own module docstring and C2's body).
+#: `wasteReport` added by
+#: docs/plans/2026-08-28-waste-number-reaches-the-reviewer.md chunk C3 -- a
+#: repo-relative path to the slice's attributed waste report (see
+#: `_write_waste_report` below), never an inline dict, matching every other
+#: artifact key in this set.
+_SLICE_KEYS = {"id", "diffPath", "reviewer", "wasteReport"}
+_ROLE_PAYLOAD_KEYS = {"sidecarPath", "contractBlocks"}
+
+#: Matches a git unified-diff file header, e.g. "diff --git a/foo.py b/foo.py".
+#: The b/ (post-image) side is the changed repo-relative path this composer
+#: attributes against -- reliable even for a deletion (whose "+++" line reads
+#: "/dev/null") because the "diff --git" header always names both sides by
+#: their tree path, never /dev/null.
+_DIFF_GIT_HEADER = re.compile(r"^diff --git a/(.+?) b/(.+)$")
+
+
+class ComposeError(RuntimeError):
+    """A fail-loud precondition. `main()` prints `str(exc)` to stderr and
+    exits non-zero -- never a silent degrade, per this module's whole
+    inverted-posture rationale (see module docstring)."""
+
+
+def _load_role_append() -> str:
+    """Part (iv): the resolved role-framing prose, read verbatim from its
+    canonical snippet source. Unlike every other leg in this module, a
+    missing snippet here is a hard configuration break -- still routed
+    through ComposeError, fail-loud like everything else here."""
+    snippet_path = _role_snippet_path()
+    if snippet_path is None:
+        raise ComposeError(
+            "agent-role-dispatched snippet unreadable: coordinator-claude plugin root "
+            "could not be resolved"
+        )
+    try:
+        return snippet_path.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        raise ComposeError(
+            f"agent-role-dispatched snippet unreadable at {snippet_path}: {exc}"
+        ) from exc
+
+
+def _load_policy(policy_file: Optional[Path]) -> dict:
+    if policy_file is None:
+        policy_file = _default_policy_path()
+    if policy_file is None:
+        raise ComposeError(
+            "subagent-sandbox-policy.yaml unreadable: coordinator-claude plugin root "
+            "could not be resolved -- pass --policy explicitly"
+        )
+    try:
+        text = policy_file.read_text(encoding="utf-8")
+    except Exception as exc:
+        raise ComposeError(
+            f"subagent-sandbox-policy.yaml unreadable at {policy_file}: {exc}"
+        ) from exc
+    try:
+        import yaml
+    except ImportError:  # pragma: no cover - environment defect, not a code path under test
+        raise ComposeError("PyYAML is not installed; cannot parse subagent-sandbox-policy.yaml")
+    try:
+        data = yaml.safe_load(text)
+    except Exception as exc:
+        raise ComposeError(
+            f"subagent-sandbox-policy.yaml malformed at {policy_file}: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ComposeError(
+            f"subagent-sandbox-policy.yaml at {policy_file} did not parse to a mapping"
+        )
+    return data
+
+
+def _contract_block_names(policy: dict, agent_type: str) -> list[str]:
+    """Ordered block-name list for `agent_type`, read from `contract_blocks:`.
+
+    A real `yaml.safe_load` result, never a hardcoded list or count (today
+    that resolves to three blocks for coordinator:code-reviewer -- this
+    function must not encode that number). A structurally absent `contract_blocks:` MAPPING is a
+    malformed policy and fails loud; an absent or non-list entry for one
+    `agent_type` fails open to `[]`, mirroring the policy file's own
+    documented lookup-miss contract -- an empty block list then surfaces
+    downstream as a missing `injected_prompt_blocks` key from
+    provision_report, which `_provision_phase` below already treats as a
+    fail-loud precondition.
+    """
+    contract_blocks = policy.get("contract_blocks")
+    if not isinstance(contract_blocks, dict):
+        raise ComposeError("policy carries no contract_blocks: mapping")
+    names = contract_blocks.get(agent_type)
+    if not isinstance(names, list):
+        return []
+    return [name for name in names if isinstance(name, str)]
+
+
+def _resolve_report_type(policy: dict, agent_type: str) -> str:
+    """Mirror the hook's Concern B.1: subagent_type -> template type via
+    `report_type_map:`. Fail-open to "" (no --type flag; provision_report's
+    own default applies) on any absent/malformed mapping -- matching the
+    hook's own tolerance for this leg exactly, since an unmapped identity
+    getting the default template is not itself a catering failure."""
+    report_type_map = policy.get("report_type_map")
+    if not isinstance(report_type_map, dict):
+        return ""
+    report_type = report_type_map.get(agent_type)
+    return report_type if isinstance(report_type, str) else ""
+
+
+def _resolve_engine_root(explicit_root: Optional[str]) -> str:
+    """Resolve the engine root, explicit override first.
+
+    `--engine-root-override`, when given, is validated the same way the hook's own
+    rung-0 override is (must exist and contain `coordinator_core/`) --
+    an unhealthy explicit override is exactly as unreachable as no root at
+    all. Otherwise delegates to the shared `cc_invoke.require_dispatch_engine_on_path`
+    seam. Either way, an unresolved root raises ComposeError with the
+    NAMED precondition `coordinator_core unreachable` -- distinguishable on
+    stderr from a missing-contract-block failure, because the operator
+    remedy for each differs (module docstring).
+    """
+    if explicit_root:
+        root_path = Path(explicit_root)
+        if root_path.is_dir() and (root_path / "coordinator_core").is_dir():
+            return str(root_path)
+        raise ComposeError("coordinator_core unreachable")
+
+    try:
+        root = _require_dispatch_engine()
+    except Exception:
+        root = None
+    if not root:
+        raise ComposeError("coordinator_core unreachable")
+    return root
+
+
+def _repo_relative(path_str: str) -> str:
+    """Normalize an emitted path to repo-relative POSIX form.
+
+    The emitted args object is consumed by a Workflow script and handed to
+    dispatched phases, so every path in it must be repo-relative: an absolute
+    path bakes THIS checkout's root into the payload, which makes a composed
+    wave non-portable and non-reproducible on any other host or clone.
+
+    Applied at the emission chokepoint rather than trusting each producer.
+    `freeze-review-diff` prints an absolute path on this box despite its
+    contract saying otherwise, and a pass-through `diffPath` comes from a
+    caller-authored manifest that this script does not control -- normalizing
+    where the value enters the payload covers both without either producer
+    having to be trusted.
+    """
+    candidate = Path(path_str)
+    if not candidate.is_absolute():
+        return PurePosixPath(candidate.as_posix()).as_posix()
+    try:
+        return candidate.resolve().relative_to(_REPO_ROOT.resolve()).as_posix()
+    except ValueError:
+        # Genuinely outside the repo -- emitting a wrong relative path would be
+        # worse than an honest absolute one.
+        return candidate.as_posix()
+
+
+def _freeze_slices_batch(requests: list[dict[str, str]]) -> list[dict]:
+    """Freeze every slice in `requests` (each `{"slice_id": ..., "range": ...}`)
+    via ONE in-process call to `coordinator_core.ops.review_freeze_diff.
+    freeze_diffs_batch` -- never the `freeze-review-diff` CLI, and never one
+    call per slice (that per-slice CLI spawn was amplification site
+    `compose:649` in the pre-batch inventory; this function's only caller,
+    `compose()`, calls it exactly once, outside its per-slice loop).
+
+    Returns `freeze_diffs_batch`'s own result list, same order as `requests`
+    -- `compose()` maps each entry back onto its slice and raises
+    `ComposeError` (this module's own fail-loud posture) on any per-request
+    `error`, rather than this function doing it, so the one ComposeError
+    wording for "which slice, what precondition" lives in one place.
+
+    Module-scope inert per this module's own bootstrap convention -- the
+    import happens here, not at module import time, matching every other
+    `coordinator_core`-reaching function in this file.
+
+    NO TRAIL RECORD IS REQUESTED, and its absence is not a gap. `review_trail.
+    write` was gravestoned at kill-ledger K-060 (2026-08-27, content repo) and
+    the engine's CLI has no legacy fallback by design.
+
+    The sha-range binding it protected did not depend on it. This slice's
+    range reaches the reviewer as the manifest's own `shaRange`, and the
+    reviewer attests `reviewed_range` into its sidecar -- which, per
+    `artifact-shape-contract.schema.json`, "ADMITS, NEVER REPLACES" a trail
+    record and "does not duplicate or re-implement" it. The attestation was
+    always the binding; the trail record was a separate artifact it admitted.
+    With nothing written, there is nothing to admit, and nothing else changes.
+    """
+    _require_dispatch_engine()
+    from coordinator_core.ops.review_freeze_diff import freeze_diffs_batch
+
+    try:
+        return _call_bounded("freeze_diffs_batch", freeze_diffs_batch, _REPO_ROOT, requests)
+    except Exception as exc:
+        raise ComposeError(f"freeze_diffs_batch failed for this wave: {exc}") from exc
+
+
+def _slice_attribution_view(union_attribution: dict, slice_paths: set[str]) -> dict:
+    """Narrow ONE union-wide `waste-signal.py --attribute-diff` result (run
+    over every slice's changed paths combined -- see `compose()`'s own
+    docstring for why this replaced amplification site `compose:658`) down
+    to the view for `slice_paths` alone: "give each slice the attribution for
+    its own paths" (module docstring).
+
+    `attributable_paths`/`attributable_redundant_opens` (dynamic) and
+    `static.per_path` are PER-PATH -- `AttributedWasteReport.as_report()` and
+    `StaticWasteReport.as_report()` both key their per-path breakdown by
+    path (coordinator/bin/waste-signal.py), so filtering to `path in
+    slice_paths` and re-summing `attributable_redundant_opens` from the
+    filtered list is exact, not an approximation.
+
+    `elsewhere_in_repo_redundant_opens`/`out_of_repo_redundant_opens`/
+    `status`/`reason`/`basis` and `static`'s own `duplicate_groups`/
+    `dropped_count`/`call_status`/`hint` stay as the union computed them --
+    they were already aggregate, run-scoped facts under the pre-batch
+    per-slice call (each slice's own `_run_waste_attribution` reported them
+    for ITS OWN changed-path set only; sharing one union-wide value across
+    every slice is the one axis this restructuring changes, and it is
+    unavoidable without re-running the instrument per slice, exactly the
+    amplification this change exists to remove)."""
+    view = dict(union_attribution)
+
+    attributable_paths = [
+        entry
+        for entry in union_attribution.get("attributable_paths", [])
+        if isinstance(entry, dict) and entry.get("path") in slice_paths
+    ]
+    view["attributable_paths"] = attributable_paths
+    view["attributable_redundant_opens"] = sum(
+        entry.get("redundant_opens", 0) for entry in attributable_paths
+    )
+
+    static = union_attribution.get("static")
+    if isinstance(static, dict):
+        static_view = dict(static)
+        per_path = static.get("per_path")
+        if isinstance(per_path, dict):
+            static_view["per_path"] = {
+                path: entry for path, entry in per_path.items() if path in slice_paths
+            }
+        view["static"] = static_view
+
+    return view
+
+
+def _provision_key(run_id: str, slice_id: str, role: str) -> str:
+    return f"wsc-{run_id}.{slice_id}.{role}"
+
+
+def _provision_phase(
+    *,
+    claude_klabauter_root: str,
+    policy_file: Path,
+    agent_type: str,
+    session_id: str,
+    provision_key: str,
+    contract_block_names: list[str],
+    report_type: str,
+) -> tuple[str, str]:
+    """One IN-PROCESS call resolving BOTH catering parts (i) resolved
+    contract_blocks prose and (ii) the pre-allocated sidecar path for a
+    single phase -- `provision_report._provision` /
+    `assemble_contract_blocks_for_payload` directly, the same functions the
+    `python -m coordinator_core.subagent_sandbox.provision_report` CLI this
+    replaced called as its own last step. No cold interpreter, no
+    `PYTHONPATH` env splice: `_require_dispatch_engine()` has already put
+    `claude_klabauter_root` on this process's own `sys.path` (via `_resolve_engine_root`,
+    called once in `compose()` before this per-slice/per-role loop), and is
+    re-called here (idempotent -- a no-op once already inserted) so this
+    function is safe to call standalone. `main()`'s own `--type` default
+    ("run-report", applied only when the payload doesn't already carry one)
+    is mirrored here rather than inherited, since there is no CLI arg parser
+    in this path to apply it for us.
+
+    Any failure leg here (either function raising, either output value
+    missing) is a ComposeError -- fail loud, never fail open, per this
+    module's inverted posture."""
+    _require_dispatch_engine()
+    from coordinator_core.subagent_sandbox.provision_report import (
+        _provision,
+        assemble_contract_blocks_for_payload,
+    )
+
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        "agent_type": agent_type,
+        "provision_key": provision_key,
+        "type": report_type or "run-report",
+    }
+    if contract_block_names:
+        payload["contract_blocks"] = contract_block_names
+
+    try:
+        sidecar_path = _call_bounded(
+            "provision_report._provision", _provision, payload, str(policy_file), str(_REPO_ROOT)
+        )
+    except Exception as exc:
+        raise ComposeError(
+            f"provision_report._provision failed for {agent_type}/{provision_key}: {exc}"
+        ) from exc
+
+    try:
+        injected_blocks = _call_bounded(
+            "provision_report.assemble_contract_blocks_for_payload",
+            assemble_contract_blocks_for_payload,
+            payload,
+            cwd=None,
+            report_sidecar_path=sidecar_path,
+        )
+    except Exception as exc:
+        raise ComposeError(
+            f"provision_report.assemble_contract_blocks_for_payload failed for "
+            f"{agent_type}/{provision_key}: {exc}"
+        ) from exc
+
+    if not isinstance(sidecar_path, str) or not sidecar_path:
+        raise ComposeError(
+            f"provision_report returned no report_sidecar for {agent_type}/{provision_key} "
+            "-- reviewer would arrive uncatered"
+        )
+    if not isinstance(injected_blocks, str) or not injected_blocks:
+        raise ComposeError(
+            f"provision_report returned no injected_prompt_blocks for {agent_type}/{provision_key} "
+            "-- a contract block could not be assembled"
+        )
+
+    return sidecar_path, injected_blocks
+
+
+def _changed_paths_from_diff(diff_path: Path) -> list[str]:
+    """Derive the changed repo-relative POSIX paths from a slice's own frozen
+    diff, per docs/plans/2026-08-28-waste-number-reaches-the-reviewer.md
+    chunk C3: "COMPUTE PER SLICE, FROM THE SLICE'S OWN DIFF."
+
+    Reads `diff --git a/X b/Y` headers only -- the one line every unified
+    diff carries for every touched file (add, modify, delete, rename alike)
+    that always names a real tree path on both sides, unlike `+++`/`---`
+    which read `/dev/null` for an add or a delete. An unreadable or
+    diff-less file returns an empty list, which the caller treats as
+    "no executable surface" (AC4's not-measurable case), never a crash.
+    """
+    try:
+        text = diff_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    paths: set[str] = set()
+    for line in text.splitlines():
+        match = _DIFF_GIT_HEADER.match(line)
+        if match:
+            paths.add(PurePosixPath(match.group(2)).as_posix())
+    return sorted(paths)
+
+
+def _not_measurable_attribution(reason: str) -> dict:
+    """The shared not-measurable shape this composer emits whenever it
+    cannot even reach `waste-signal.py --attribute-diff` -- mirrors
+    `AttributedWasteReport`'s own `as_report()` keys (module docstring's
+    dependency-direction note: the composer parses the instrument's shape,
+    it does not invent a competing one) plus `resolved_tests`, always `[]`
+    here since no child process ever ran."""
+    return {
+        "status": "not-measurable",
+        "reason": reason,
+        "attributable_redundant_opens": 0,
+        "attributable_paths": [],
+        "elsewhere_in_repo_redundant_opens": 0,
+        "out_of_repo_redundant_opens": 0,
+        "basis": None,
+        "resolved_tests": [],
+    }
+
+
+def _extract_trailing_json_object(text: str) -> Optional[dict]:
+    """Recover the JSON object `waste-signal.py --attribute-diff` prints as
+    the LAST thing on its stdout, even when a resolved covering test's own
+    `pytest.main()` run has already written its console report to the SAME
+    stream ahead of it (measured live: `pytest.main()` writes its report to
+    real `sys.stdout` before `run_attribute_diff` returns, so a subprocess
+    pipe interleaves both onto one fd -- `json.loads(stdout)` on the whole
+    capture then fails even on a clean, successful run).
+
+    Defensive trailing-object extraction -- never a change to how `waste-signal.py`
+    itself prints, which stays out of this chunk's `writes:` scope. Returns
+    `None` (never raises) if no suffix of the output parses as a JSON
+    object, which the caller folds into the same not-measurable path as
+    every other unparseable-output case."""
+    lines = text.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip() != "{":
+            continue
+        candidate = "\n".join(lines[i:])
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _run_waste_attribution(changed_paths: list[str], repo_root: Path) -> dict:
+    """Spawn `waste-signal.py --attribute-diff <changed_paths>` as this
+    composer's OWN CHILD and parse its printed JSON, per chunk C3's "ARM THE
+    HOOK IN THE SAME PROCESS AS THE TESTS -- AND MAKE THAT PROCESS A CHILD":
+    the instrument arms `sys.addaudithook` and runs the resolved covering
+    tests inside ONE process (visibility), while this composer never runs a
+    test suite in its own process (crash isolation, per
+    coordinator/docs/wiki/test-environment-discipline.md:161/168, content repo).
+    This composer hosts no test-running logic of its own -- it names the
+    child's stdout and parses it; the instrument owns test resolution, hook
+    arming, and running.
+
+    A missing executable surface (no changed paths at all -- the common case,
+    since only ~14% of this repo's commits touch a `.py`) short-circuits
+    before spawning: `--attribute-diff` requires at least one path argument,
+    so there is nothing to hand it. A non-zero child return code, an
+    unspawnable child, or unparseable stdout all degrade to the SAME
+    not-measurable shape with the returncode/reason folded in -- this is
+    NOT a `ComposeError`: unlike this module's fail-loud structural
+    preconditions (policy, engine root, contract blocks), a measurement
+    that could not be taken is itself the honest AC4 answer, not a reason to
+    abort composing the review payload.
+    """
+    if not changed_paths:
+        return _not_measurable_attribution(
+            "diff carried no parseable changed paths -- no executable surface to attribute against"
+        )
+
+    import lib  # noqa: F401 -- bootstraps coordinator/bin/lib onto sys.path
+    from python_interp import python_argv
+
+    argv = python_argv(str(_WASTE_SIGNAL_SCRIPT), "--attribute-diff", *changed_paths)
+    if argv is None:
+        return _not_measurable_attribution("no console Python interpreter resolvable")
+
+    # The child runs the slice's own covering tests, which is branch code this
+    # gate does not yet trust. Give it a scratch HOME/TMP so a test writing to
+    # a user-level config or dotfile cannot mutate the tree being reviewed --
+    # the isolation the plan's Anti-scope promised, and the HOME-capture hazard
+    # test-environment-discipline.md sec.4 records. cwd stays repo_root: the child
+    # resolves repo-relative paths against it, and a scratch cwd would break
+    # attribution rather than isolate anything.
+    with tempfile.TemporaryDirectory(prefix="waste-attr-") as scratch:
+        child_env = dict(os.environ)
+        child_env["HOME"] = scratch
+        child_env["USERPROFILE"] = scratch
+        child_env["TMPDIR"] = scratch
+        child_env["TEMP"] = scratch
+        child_env["TMP"] = scratch
+        try:
+            proc = subprocess.run(
+                argv,
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                env=child_env,
+                timeout=_WASTE_ATTRIBUTION_TIMEOUT_S,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired:
+            # A hung covering test must degrade to not-measurable, never block the
+            # review wave -- an unbounded wait here is the "review gate dies with
+            # the reviewer's payload" failure the child-process design exists to
+            # prevent, arriving by hang instead of by crash.
+            return _not_measurable_attribution(
+                f"waste-signal --attribute-diff exceeded {_WASTE_ATTRIBUTION_TIMEOUT_S}s and was killed"
+            )
+        except Exception as exc:
+            return _not_measurable_attribution(f"waste-signal --attribute-diff failed to spawn: {exc}")
+
+    parsed: Optional[dict] = None
+    if proc.returncode == 0:
+        try:
+            candidate = json.loads(proc.stdout)
+            if isinstance(candidate, dict):
+                parsed = candidate
+        except Exception:
+            parsed = _extract_trailing_json_object(proc.stdout or "")
+
+    if parsed is None:
+        return _not_measurable_attribution(
+            f"waste-signal --attribute-diff exited {proc.returncode} with no parseable JSON on "
+            f"stdout: {(proc.stderr or '').strip()[:500]}"
+        )
+
+    attribution = parsed.get("attribution")
+    if not isinstance(attribution, dict):
+        return _not_measurable_attribution(
+            "waste-signal --attribute-diff printed JSON with no 'attribution' object"
+        )
+
+    rendered = dict(attribution)
+    rendered["resolved_tests"] = parsed.get("resolved_tests", [])
+    return rendered
+
+
+def _write_waste_report(report: dict, run_id: str, slice_id: str) -> Path:
+    """Persist the slice's attributed waste report to a deterministic,
+    slice-and-run-scoped path -- the FILE this composer emits under the
+    `wasteReport` key (a path, like `diffPath`, never an inline
+    dict -- see `_SLICE_KEYS`'s own comment)."""
+    out_dir = _REPO_ROOT / "state" / "review-trail" / "waste-reports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{run_id}.{slice_id}.json"
+    tmp = out_path.with_name(f".{out_path.name}.tmp{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(report, indent=2), encoding="utf-8", newline="\n")
+        os.replace(tmp, out_path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return out_path
+
+
+def _resolve_plan_path(plan_str: str, repo_root: Path) -> Path:
+    """Repo-relative or absolute -- mirrors `pm-brief.py`'s own CLI resolution
+    so a caller passing either shape behaves identically through both seams."""
+    candidate = Path(plan_str)
+    return candidate if candidate.is_absolute() else repo_root / candidate
+
+
+def _reviewer_plan_brief_block(manifest: dict, repo_root: Path) -> str:
+    """The text appended to the REVIEWER role's contractBlocks only, after
+    `role_append` -- the declared-absence line with no `plans` key or an
+    empty list, or one `render_block(brief, "reviewer")` per listed plan,
+    joined verbatim. A plan that resolves no brief is a `ComposeError`,
+    same fail-loud rule as every other precondition in this module."""
+    plans = manifest.get("plans")
+    if not isinstance(plans, list) or not plans:
+        return _NO_PLAN_BRIEF_LINE
+    import lib  # noqa: F401 -- bootstraps coordinator/bin/lib onto sys.path
+    from pm_brief import NoPmBriefError, render_block, resolve as resolve_pm_brief
+
+    blocks: list[str] = []
+    for plan_str in plans:
+        if not isinstance(plan_str, str) or not plan_str:
+            raise ComposeError(f"manifest 'plans' entry is not a non-empty string: {plan_str!r}")
+        plan_path = _resolve_plan_path(plan_str, repo_root)
+        try:
+            brief = resolve_pm_brief(plan_path, repo_root)
+        except NoPmBriefError as exc:
+            raise ComposeError(str(exc)) from exc
+        blocks.append(render_block(brief, "reviewer"))
+    return "\n\n".join(blocks)
+
+
+def compose(
+    manifest: dict,
+    *,
+    run_id: str,
+    session_id: str,
+    policy_file: Optional[Path] = None,
+    claude_klabauter_root_override: Optional[str] = None,
+) -> dict:
+    """Compose the args object. Raises ComposeError on any missing
+    precondition -- see module docstring. `policy_file=None` resolves the
+    default through the coordinator-claude plugin root (see
+    `_default_policy_path`), never a `Path(__file__)`-relative default."""
+    policy = _load_policy(policy_file)
+    role_append = _load_role_append()
+    claude_klabauter_root = _resolve_engine_root(claude_klabauter_root_override)
+
+    slices_in = manifest.get("slices")
+    if not isinstance(slices_in, list) or not slices_in:
+        raise ComposeError("manifest carries no slices")
+
+    # Resolved once for the whole wave: every slice's reviewer gets the same
+    # plan-scoped PM brief text.
+    reviewer_plan_brief_block = _reviewer_plan_brief_block(manifest, _REPO_ROOT)
+
+    # The sidecar directory MUST be the session the fired phases actually run
+    # under, never a synthetic one. `provision_report` resolves a sidecar to
+    # `state/subagent-share/<session_id>/<provision_key>.md`, and the Edit
+    # confinement guard confines every agent's writes to the directory named by
+    # its OWN runtime session id. A workflow-spawned phase inherits the EM's
+    # session, so a composed-in `wsc-<run_id>` directory is one no fired phase
+    # can write to: the reviewer reads its provisioned scaffold and is denied
+    # on write. Measured live -- run wf_1800c597-781 lost all five slices this
+    # way. Slice-bearing uniqueness lives in `provision_key` (the FILENAME),
+    # which is what AC5 actually requires, so nothing is lost by dropping the
+    # per-run directory.
+
+    # Pass 1: validate every slice entry and resolve its range/diffPath.
+    # Slices lacking a pre-frozen `diffPath` are collected here, never frozen
+    # inline -- amplification site `compose:649` (one `freeze-review-diff`
+    # CLI spawn per slice) is closed by freezing the whole collected set in
+    # ONE call after this loop, not inside it (module docstring).
+    slice_ids: list[str] = []
+    range_specs: list[str] = []
+    diff_paths: list[Optional[str]] = []
+    freeze_requests: list[dict[str, str]] = []
+    freeze_positions: list[int] = []
+
+    for slice_entry in slices_in:
+        if not isinstance(slice_entry, dict):
+            raise ComposeError("a slice entry is not a JSON object")
+
+        slice_id = slice_entry.get("id")
+        if not isinstance(slice_id, str) or not slice_id:
+            raise ComposeError("a slice entry is missing its id")
+
+        # A slice must name the sha range it covers whether or not it also
+        # supplies a pre-frozen diff. `reviewed_range` is writable ONLY by the
+        # reviewing subagent (artifact-shape-contract.schema.json), so a range
+        # that never reaches the reviewer's payload can never be attested by
+        # anyone -- and the attestation is now the whole binding, since
+        # review_trail.write was gravestoned at K-060. This requirement
+        # therefore OUTLIVED the trail record rather than depending on it: a
+        # pre-frozen `diffPath` with no `range` still yields a review nothing
+        # can bind to a range, which is what it produced on 2026-08-18.
+        range_spec = slice_entry.get("range")
+        if not isinstance(range_spec, str) or not range_spec:
+            raise ComposeError(
+                f"slice {slice_id!r} carries no range -- a pre-frozen diffPath does "
+                "not substitute for it, because the reviewer cannot attest a "
+                "reviewed_range it was never given"
+            )
+
+        slice_ids.append(slice_id)
+        range_specs.append(range_spec)
+
+        diff_path = slice_entry.get("diffPath")
+        if isinstance(diff_path, str) and diff_path:
+            diff_paths.append(diff_path)
+        else:
+            diff_paths.append(None)
+            freeze_positions.append(len(diff_paths) - 1)
+            freeze_requests.append({"slice_id": slice_id, "range": range_spec})
+
+    if freeze_requests:
+        freeze_results = _freeze_slices_batch(freeze_requests)
+        for pos, result in zip(freeze_positions, freeze_results):
+            slice_id = slice_ids[pos]
+            if result.get("error"):
+                raise ComposeError(
+                    f"freeze_diffs_batch failed for slice {slice_id!r}: {result['error']}"
+                )
+            frozen_path = result.get("diff_path")
+            if not isinstance(frozen_path, str) or not frozen_path:
+                raise ComposeError(
+                    f"freeze_diffs_batch produced no diff_path for slice {slice_id!r} -- "
+                    "the reviewer would arrive with nothing to review"
+                )
+            diff_paths[pos] = frozen_path
+
+    # Pass 2: derive every slice's changed paths from its OWN frozen diff
+    # (pure file reads -- no spawn), then attribute the UNION of every
+    # slice's changed paths in ONE `waste-signal.py --attribute-diff` child
+    # -- amplification site `compose:658` (one child per slice) is closed by
+    # running the instrument once over the combined set and splitting its
+    # per-path result back out per slice (`_slice_attribution_view`), never
+    # by re-running it per slice. C3 of
+    # docs/plans/2026-08-28-waste-number-reaches-the-reviewer.md: attribute
+    # each slice's own diff, never the reviewer's or the emitter's -- see
+    # _run_waste_attribution's docstring for the child-process
+    # crash-isolation rationale.
+    changed_paths_by_slice: list[list[str]] = []
+    union_paths: set[str] = set()
+    for diff_path in diff_paths:
+        assert isinstance(diff_path, str) and diff_path  # pass 1 guarantees this
+        diff_path_obj = Path(diff_path)
+        if not diff_path_obj.is_absolute():
+            diff_path_obj = _REPO_ROOT / diff_path_obj
+        changed_paths = _changed_paths_from_diff(diff_path_obj)
+        changed_paths_by_slice.append(changed_paths)
+        union_paths.update(changed_paths)
+
+    union_attribution = _run_waste_attribution(sorted(union_paths), _REPO_ROOT)
+
+    slices_out: list[dict[str, Any]] = []
+    for idx, slice_id in enumerate(slice_ids):
+        range_spec = range_specs[idx]
+        diff_path = diff_paths[idx]
+        changed_paths = changed_paths_by_slice[idx]
+
+        waste_attribution = _slice_attribution_view(union_attribution, set(changed_paths))
+        waste_report_path = _write_waste_report(
+            {"changed_paths": changed_paths, "attribution": waste_attribution},
+            run_id,
+            slice_id,
+        )
+
+        role_payloads: dict[str, dict[str, str]] = {}
+        for role, agent_type in _ROLE_AGENT_TYPE.items():
+            block_names = _contract_block_names(policy, agent_type)
+            report_type = _resolve_report_type(policy, agent_type)
+            provision_key = _provision_key(run_id, slice_id, role)
+            sidecar_path, injected_blocks = _provision_phase(
+                claude_klabauter_root=claude_klabauter_root,
+                policy_file=policy_file or _default_policy_path(),
+                agent_type=agent_type,
+                session_id=session_id,
+                provision_key=provision_key,
+                contract_block_names=block_names,
+                report_type=report_type,
+            )
+            # Parts (i) and (iv) concatenated, role framing LAST -- see
+            # module docstring and coordinator/hooks/scripts/
+            # enforce-agent-dispatch-mode.py's own ordering (content repo)
+            # (sidecar offer -> injected contract -> role framing).
+            contract_blocks_text = injected_blocks.rstrip("\n") + "\n\n" + role_append
+            if role == "reviewer":
+                contract_blocks_text += "\n\n" + reviewer_plan_brief_block
+            role_payloads[role] = {
+                "sidecarPath": sidecar_path,
+                "contractBlocks": contract_blocks_text,
+            }
+
+        slices_out.append(
+            {
+                "id": slice_id,
+                "diffPath": _repo_relative(diff_path),
+                # The reviewer attests `shaRange` into its sidecar's
+                # `reviewed_range`; nothing downstream can supply it on the
+                # reviewer's behalf, and review_trail.write gates on it.
+                "shaRange": range_spec,
+                "wasteReport": _repo_relative(str(waste_report_path)),
+                "reviewer": role_payloads["reviewer"],
+            }
+        )
+
+    return {"slices": slices_out}
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument(
+        "--run-id",
+        required=True,
+        help="Stable run identifier, e.g. YYYYMMDD-HHMMSS. Reused across "
+        "every composer invocation for one run -- see module docstring on "
+        "why this is required, never wall-clock-defaulted.",
+    )
+    parser.add_argument(
+        "--session-id",
+        required=True,
+        help="The session id the FIRED phases will run under -- for a workflow "
+        "spawn that is the EM's own session, since a workflow-spawned agent "
+        "inherits it. Required, never synthesized: the Edit confinement guard "
+        "confines each agent's writes to <machinery_root>/subagent-share/<its own "
+        "session id>/, so a sidecar provisioned anywhere else is one no fired phase can "
+        "write to, and the wave is lost on the reviewer leg.",
+    )
+    parser.add_argument(
+        "--policy",
+        default=None,
+        type=Path,
+        help="policy path (default: resolved through the coordinator-claude plugin root)",
+    )
+    parser.add_argument(
+        "--engine-root-override",
+        dest="engine_root_override",  # neutral: the publish transform renames codename identifiers
+        default=None,
+        help="Explicit override for engine-root resolution (testing/CI use). "
+        "Defaults to the shared cc_invoke dispatch-engine resolution ladder.",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        manifest_text = args.manifest.read_text(encoding="utf-8")
+    except Exception as exc:
+        print(f"compose-review-wave: manifest unreadable at {args.manifest}: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        manifest = json.loads(manifest_text)
+    except Exception as exc:
+        print(f"compose-review-wave: manifest not valid JSON at {args.manifest}: {exc}", file=sys.stderr)
+        return 1
+
+    if not isinstance(manifest, dict):
+        print(f"compose-review-wave: manifest at {args.manifest} is not a JSON object", file=sys.stderr)
+        return 1
+
+    try:
+        result = compose(
+            manifest,
+            run_id=args.run_id,
+            session_id=args.session_id,
+            policy_file=args.policy,
+            claude_klabauter_root_override=args.engine_root_override,
+        )
+    except ComposeError as exc:
+        print(f"compose-review-wave: {exc}", file=sys.stderr)
+        return 1
+
+    sys.stdout.write(json.dumps(result))
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

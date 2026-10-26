@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""
+coordinator-prepare-commit-msg (extensionless twin) — thin in-process delegate
+to ``coordinator-prepare-commit-msg.py``, this file's own sibling in this
+directory.
+
+C14 fix (2026-08-21, "the diverged prepare-commit-msg twin"): this file used
+to carry a full, hand-duplicated 869-line copy of the hook logic, which had
+drifted behind the ``.py`` twin — most visibly, it spawned every subprocess
+WITHOUT Windows console suppression (no ``creationflags=CREATE_NO_WINDOW``),
+so a headless box running this copy popped a console window on every commit.
+``git_hook_install._shim_body``'s baked-path fallback rung tries THIS bare
+name before the ``.py`` suffix (``[ -f "$SCRIPT" ] || SCRIPT="<bin>/<name>"``
+ahead of the ``.py`` probe), so any environment where the settings-home
+forwarder rung is unavailable — forwarder uninstalled, ``$HOME`` moved, the
+settings-home env var unset — silently fell through to this stale copy
+instead of the current one. Two independently-maintained copies of a hook
+this security/attribution-sensitive is also just a standing invitation for
+future drift of the same shape, even with today's contents fixed by hand.
+
+Fix: this file no longer carries independent logic at all. It loads
+``coordinator-prepare-commit-msg.py`` from disk (via ``importlib.util`` —
+that file's name is not an importable module path, it has a ``.py``
+extension but a hyphenated stem) and calls its ``main()`` directly, in the
+SAME process, with the SAME ``sys.argv`` this script itself was invoked
+with. There is exactly one implementation on disk from here on; this file is
+a locator, not a fork.
+
+Deliberately NOT a ``subprocess`` re-exec: a git hook already pays one
+process-spawn cost to reach this script at all (the shell shim that invokes
+it, per ``git_hook_install._shim_body``); spawning a SECOND python process
+from inside it to reach the real logic would double that cost for every
+commit on every box, for no behavioural gain over an in-process module load.
+
+Fail-open, matching the target's own "NEVER blocks a commit" contract: any
+failure locating, loading, or running the target (missing sibling file,
+import error, unexpected exception) is swallowed here and this process exits
+0 — a commit must never be blocked by this delegate shim failing to find its
+own twin.
+
+Spec backlink: see ``coordinator-prepare-commit-msg.py``'s own module
+docstring for the full trailer-injection behaviour this delegates to.
+"""
+from __future__ import annotations
+
+import importlib.util
+import os
+import sys
+
+
+def _load_target_main():
+    """Load ``coordinator-prepare-commit-msg.py`` (this file's own sibling)
+    via ``importlib.util.spec_from_file_location`` and return its ``main``
+    callable, or ``None`` on any failure — never raises."""
+    try:
+        target_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "coordinator-prepare-commit-msg.py",
+        )
+        spec = importlib.util.spec_from_file_location(
+            "_coordinator_prepare_commit_msg_impl", target_path
+        )
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return getattr(module, "main", None)
+    except Exception:
+        return None
+
+
+if __name__ == "__main__":
+    # Top-level fail-open guard, mirroring the target's own backstop: a
+    # delegate that cannot even locate/load its twin must still never block
+    # a commit.
+    try:
+        _main = _load_target_main()
+        if _main is None:
+            sys.exit(0)
+        sys.exit(_main(sys.argv[1:]))
+    except SystemExit:
+        raise
+    except Exception:
+        sys.exit(0)

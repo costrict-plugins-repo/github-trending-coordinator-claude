@@ -1,0 +1,23 @@
+{
+  "name": "coordinator-claude",
+  "owner": {
+    "name": "Dónal O'Duffy & Claude"
+  },
+  "metadata": {
+    "description": "Structured agent orchestration for Claude Code — multi-agent workflows, named reviewer personas, session continuity, and workflow skills.",
+    "version": "4.6.9"
+  },
+  "plugins": [
+    {
+      "name": "coordinator",
+      "source": "./",
+      "description": "Coordinator plugin: plan-enrich-chunk-review pipeline, named reviewer personas (the Staff Engineer, the Director of Engineering, the Game Dev Reviewer, the Data Science Reviewer, the UX Reviewer, the Front-End Reviewer), fan-out dispatch, session continuity via handoffs and flight recorders, and workflow skills (/plan, /review, /execute-plan, /workday-start, /workstream-complete).",
+      "tags": [
+        "orchestration",
+        "agents",
+        "workflow",
+        "code-review"
+      ]
+    }
+  ]
+}

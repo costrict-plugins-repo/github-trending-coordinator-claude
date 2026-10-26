@@ -1,0 +1,385 @@
+"""coordinator_data_root — shared resolver for coordinator DATA directories
+(snippets/, schemas/, templates/, docs/) across the split-repo layout.
+
+The 2026-07-22 executable-surface migration moved ~1100 executables from
+Coordinator-content-repo/coordinator/{bin,lib,scripts,tests} into the engine repo's coordinator/,
+but their sibling DATA dirs — schemas/, snippets/, templates/, docs/, hooks/ —
+correctly stayed in coordinator-content-repo (DR-047: contract/data lives with DoE, engine
+with the engine repo). Any migrated script that resolved a sibling data dir via a bare
+`__file__`-relative walk (the old `bin/../<data-dir>` shape) is now broken: that
+walk lands inside the engine repo, where the data dir no longer exists.
+
+`coordinator_registry.py`'s `_MANIFEST_PATH` bootstrap (see that module, fix
+commit 4f74656c) was the first caller to hit this and fixed itself inline with
+a two-rung chain. This module extracts that SAME two-rung shape into one
+shared, importable resolver so the five (now six, counting the fixed original)
+remaining callers do not each hand-roll their own copy — six independent
+copies of the resolution chain is exactly the drift that caused this bug.
+
+Two live layouts:
+  1. Co-located    — the data dir sits beside bin/ under the same coordinator
+                     root (the pre-migration DoE layout, and any OSS install
+                     that ships both halves together). Free, no registration.
+  2. Split-repo    — this code lives in the engine repo while the data dir
+                     stayed in the content repo. Resolve the content root the
+                     same way every other doctrine CLI does
+                     (coordinator_registry.content_root()).
+
+Rung 1 first so the co-located case costs nothing and needs no registration.
+
+Rung 1.5 — codename-free ladder (added 2026-08-07, C2), ahead of the
+`content_root()` call: try, in order, the content-root pointer file (durable,
+then legacy), the real marketplace-cache install location, the flat
+`~/.claude/plugins/coordinator-claude` marketplace-clone layout, then
+`CLAUDE_PLUGIN_ROOT` (normalized via
+`_cdr_repo_root_from_plugin_root_candidate()`, C1E fix — the raw env value
+is a content root, one level below the repo root this ladder needs), then
+the registry's
+`plugin.mirrors.coordinator-claude.live_path` key — each candidate accepted
+only once it is a directory AND contains one of the two published manifest
+layouts (OSS flat `schemas/...`, private `coordinator/schemas/...`). This rung
+is largely redundant with `content_root()`'s own codename-free rungs (harmless:
+it simply wins first when it also resolves).
+
+Negative-spec: this module does NOT reimplement the content-root resolution
+chain (env REPO_CONTENT_ROOT -> machine-local repos.content_root -> raise). That
+chain lives in exactly one place, `coordinator_registry.content_root()`, and
+this module calls it rather than duplicating it. A caller that hand-rolls its
+own lookup instead of importing `data_root()` from here re-introduces the
+six-copies-of-one-chain drift this module exists to close. The rung-1.5
+codename-free ladder above is a SEPARATE, additive rung — adding it here does
+not violate this negative-spec, which is about the env/registry chain
+`content_root()` itself owns.
+
+Import-time purity (negative-spec, load-bearing): `coordinator_registry` is
+imported LAZILY, inside `data_root()`, NOT at module top level.
+`coordinator_registry` eagerly resolves its own manifest at import time (a
+`machine-local` subprocess needing `HOME` in the environment) — so a
+top-level `from coordinator_registry import ...` here would make merely
+IMPORTING this module able to fail or spawn a subprocess, even for callers
+who never call `data_root()` because rung 1 (co-located) already resolves
+their case, or who run under a stripped/minimal environment (e.g. a test
+harness that replaces rather than merges `os.environ`). This module's own
+rung-1 resolution (`_colocated_root()`) is zero-subprocess, zero-env-
+dependent by construction, and must stay that way. A future editor hoisting
+the `coordinator_registry` import back to module level reintroduces exactly
+this bug — do not do it, no matter how natural "just import it up top like
+everything else" feels. See regression test
+`coordinator/tests/test_coordinator_data_root.py` (stripped-env import
+assertion).
+
+Public API:
+    data_root(dir_name: str) -> Path
+        Resolve one of "snippets", "schemas", "templates", "docs" (or any other
+        coordinator data-dir name) to its absolute, existing directory Path.
+        Raises RuntimeError, naming the dir and both rungs tried, if neither
+        rung resolves to an existing directory. Never returns a path that
+        doesn't exist; never silently falls back to a wrong location.
+
+Spec backlink: cross-repo/archive/2026-07-22-claude-central-em-executable-surface-migrated-and-76-op-ask.md
+               (the originating memo; in cross-repo/inbox/ until the boot sweep moves it)
+DR backlink:   docs/decisions/DR-047-content-engine-boundary-redraw-contract-vs-e.md (DoE-side)
+Reference fix: coordinator/bin/lib/coordinator_registry.py `_MANIFEST_PATH` bootstrap
+               (commit 4f74656c, "coordinator_registry: resolve the schemas manifest
+               across the repo split")
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+
+# F6 fix (2026-08-08, hermetic-ac-reverify) — `claude_home()` is pure
+# (module docstring: only imports `os`, no subprocess), safe at module top
+# level like coordinator_registry.py's own `_mlir_claude_home` import.
+# Converges this module's home derivation onto the SAME semantics
+# `coordinator_registry.py::_mp_marketplace_cache_rung`/
+# `_mp_flat_layout_probe_rung` already use — `claude_home()` treats
+# `CLAUDE_HOME` as a `$HOME` substitute (Convention A) and returns
+# `<CLAUDE_HOME>/.claude`, agreeing with
+# `check_install_singularity._claude_base_dir()`. This module's own rungs
+# previously inlined `CLAUDE_HOME or HOME or USERPROFILE` and then
+# unconditionally joined `.claude`, so with `CLAUDE_HOME` set the two
+# modules probed different directories — see F6 in
+# state/review-findings/2026-08-08-successor-partitioned/hermetic-ac-reverify.md.
+from machine_local_impl_resolve import claude_home as _mlir_claude_home
+from machine_local_impl_resolve import read_content_root_pointer as _mlir_read_content_root_pointer
+
+_CDR_MANIFEST_RELPATH = os.path.join("schemas", "coordinator-registry.manifest.json")
+
+
+def _cdr_manifest_present(root: str) -> bool:
+    """True if `root` contains either published manifest layout: OSS flat
+    (`<root>/schemas/coordinator-registry.manifest.json`) or the private
+    DoE-repo shape (`<root>/coordinator/schemas/coordinator-registry.manifest.json`).
+    Gates each rung-1.5 candidate so a resolved-but-unrelated directory is
+    never accepted over a later, correct rung.
+
+    LIMITATION (C1E): probing both layouts here is deliberately
+    level-ambiguous by itself -- a CONTENT root (`<repo_root>/coordinator`)
+    satisfies the OSS-flat relpath (`<content_root>/schemas/...`) exactly as
+    readily as a genuine repo root satisfies the private relpath. This gate
+    cannot and does not disambiguate levels; it only confirms "some published
+    manifest lives under this directory." Every candidate reaching this gate
+    MUST already be repo-root-shaped BEFORE it gets here -- the pointer-file
+    and flat-layout rungs already are; `CLAUDE_PLUGIN_ROOT` is normalized to
+    repo-root shape by `_cdr_repo_root_from_plugin_root_candidate()`
+    immediately before being passed in here, precisely so this gate never has
+    to arbitrate the level question it structurally cannot answer. Do not add
+    a new rung-1.5 candidate without doing the same normalization first.
+    """
+    for relpath in (_CDR_MANIFEST_RELPATH, os.path.join("coordinator", _CDR_MANIFEST_RELPATH)):
+        if os.path.exists(os.path.join(root, relpath)):
+            return True
+    return False
+
+
+def _cdr_repo_root_from_plugin_root_candidate(candidate: str) -> str:
+    """Normalize a CLAUDE_PLUGIN_ROOT-shaped value to the coordinator REPO
+    root this ladder must return.
+
+    Single-sourced (state/debt-backlog/2026-08-08-three-divergent-copies-of-
+    the-plugin-roo-8d584d3b90d3.yaml): delegates to coordinator_core.
+    _content_root_primitive.repo_root_from_plugin_root_candidate(), the same
+    engine helper coordinator_registry.py's wrapper delegates to. This
+    copy's historical shape is reproduced via keyword args so behaviour is
+    unchanged: drive_root_guard="normpath", basename_compare="casefold",
+    manifest_relpath_fallback=False. allow_unchanged_fallback stays True:
+    every candidate here passes through `_cdr_manifest_present` afterward,
+    unlike `coordinator_registry.content_root()`'s rungs (which pass False).
+
+    The normpath/casefold/no-manifest-fallback divergences from the engine's
+    own defaults are inherited from the registry wrapper and are named as
+    explicit parameters in the engine helper's docstring; do not resolve
+    them here.
+
+    CLAUDE_PLUGIN_ROOT is a *content* root: in the private/dev DoE layout
+    `<repo_root>/coordinator`, one level below the repo root `data_root()`
+    needs (it appends "coordinator" / dir_name itself — feeding it a content
+    root double-nests). In the OSS flat layout the two coincide.
+
+    The engine import is lazy and inside this function (module docstring
+    "Import-time purity"): `cc_invoke.ensure_engine_on_path` is best-effort,
+    so an engine-less environment raises ImportError here, the same as the
+    registry wrapper.
+    """
+    import cc_invoke
+
+    cc_invoke.ensure_engine_on_path(__file__)
+    from coordinator_core._content_root_primitive import repo_root_from_plugin_root_candidate
+
+    return repo_root_from_plugin_root_candidate(
+        candidate,
+        drive_root_guard="normpath",
+        basename_compare="casefold",
+        manifest_relpath_fallback=False,
+    )
+
+
+def _cdr_flat_layout_probe_rung() -> str:
+    """Rung 1.5c: the flat `~/.claude/plugins/coordinator-claude`
+    marketplace-clone layout, gated on the `.claude-plugin/plugin.json`
+    marker — same marker `resolve_coordinator_clone._resolve_source_mode`
+    gates its OSS-install check on. Duplicated inline (matching C1/C1B's
+    shape) rather than importing a shared probe — no standalone marker check
+    exists to reuse.
+
+    NOT where Claude Code actually installs a marketplace clone (Review:
+    staff-eng MINOR-7) — see _cdr_marketplace_cache_rung() below for the
+    real install location; retained because it is a real layout this
+    codebase's own install/uninstall/sandbox-check tooling produces.
+
+    Home resolution delegates to `_mlir_claude_home()` (F6 fix, 2026-08-08)
+    — see module import comment; previously inlined a divergent
+    `CLAUDE_HOME`-or-`HOME`-or-`USERPROFILE` ladder that joined `.claude`
+    unconditionally, which happened to agree with `claude_home()` only
+    once `claude_home()` itself also treated `CLAUDE_HOME` as a `$HOME`
+    substitute (Convention A) rather than as the `.claude` dir itself.
+    """
+    home = _mlir_claude_home()
+    if not home:
+        return ""
+    candidate = os.path.join(home, "plugins", "coordinator-claude")
+    marker = os.path.join(candidate, ".claude-plugin", "plugin.json")
+    return candidate if os.path.isfile(marker) else ""
+
+
+def _cdr_marketplace_cache_rung() -> str:
+    home = _mlir_claude_home()
+    if not home:
+        return ""
+    cache_parent = os.path.join(home, "plugins", "cache", "coordinator-claude", "coordinator")
+    if not os.path.isdir(cache_parent):
+        return ""
+    best = ""
+    best_key: tuple[int, int, int] | None = None
+    try:
+        entries = os.listdir(cache_parent)
+    except OSError:
+        return ""
+    for name in entries:
+        child = os.path.join(cache_parent, name)
+        if not os.path.isdir(child):
+            continue
+        parts = name.split(".")
+        if len(parts) > 3 or any(not part.isdigit() for part in parts):
+            continue
+        nums = [int(part) for part in parts] + [0] * (3 - len(parts))
+        key = (nums[0], nums[1], nums[2])
+        if best_key is None or key > best_key:
+            best_key = key
+            best = child
+    return best
+
+
+def _cdr_codename_free_root() -> str:
+    """Rung 1.5 — codename-free ladder (C2). Runs ahead of rung 2
+    (`coordinator_registry.content_root()`). Tries, in order: the content-root
+    pointer file (durable, then legacy), the real marketplace-cache install
+    location (Review: staff-eng
+    BLOCKER-1), the flat marketplace-clone layout, `CLAUDE_PLUGIN_ROOT`,
+    then the `plugin.mirrors.coordinator-claude.live_path` registry key
+    (Review: staff-eng MAJOR-3 — routed through the same
+    CLAUDE_PLUGIN_ROOT-shaped normalizer, not trusted as a repo root
+    unconverted; see that helper's docstring). Each candidate is accepted
+    only once it is a directory AND `_cdr_manifest_present` confirms one of
+    the two published manifest layouts lives under it. See module docstring
+    for why this rung exists.
+
+    The registry sub-rung imports `coordinator_registry` LAZILY (only when
+    the earlier file rungs miss) — see module docstring's "Import-time
+    purity" negative-spec; this function is itself only ever called from
+    inside `data_root()`, never at import time.
+    """
+    _plugin_root_env = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
+    for candidate in (
+        _mlir_read_content_root_pointer(),
+        _cdr_marketplace_cache_rung(),
+        _cdr_flat_layout_probe_rung(),
+        _cdr_repo_root_from_plugin_root_candidate(_plugin_root_env) if _plugin_root_env else "",
+    ):
+        if candidate and os.path.isdir(candidate) and _cdr_manifest_present(candidate):
+            return candidate
+
+    from coordinator_registry import _registry_machine_local_get
+
+    live_path = _registry_machine_local_get("plugin.mirrors.coordinator-claude.live_path") or ""
+    if live_path:
+        live_normalized = _cdr_repo_root_from_plugin_root_candidate(live_path)
+        if live_normalized and os.path.isdir(live_normalized) and _cdr_manifest_present(live_normalized):
+            return live_normalized
+    return ""
+
+
+def _colocated_root() -> Path:
+    """The coordinator root this module's own bin/lib sits under (rung-1 base).
+
+    coordinator/bin/lib/coordinator_data_root.py -> parents[2] == coordinator/
+    (file -> lib/ -> bin/ -> coordinator/), the same triple `os.path.dirname`
+    walk `coordinator_registry.py`'s `_MANIFEST_PATH` bootstrap uses.
+    """
+    return Path(__file__).resolve().parents[2]
+
+
+def data_root(dir_name: str) -> Path:
+    """Resolve `dir_name` (e.g. "snippets", "schemas", "templates", "docs") to
+    its absolute, existing directory Path.
+
+    Resolution chain (co-located -> codename-free ladder -> content-resident):
+      1. Co-located — `<coordinator-root>/<dir_name>` beside this module's own
+         bin/lib, where `<coordinator-root>` is computed identically to
+         `coordinator_registry.py`'s manifest-path bootstrap. Free, no
+         registration, wins whenever both halves ship together.
+      1.5. Codename-free ladder (C2) — content-root pointer file, flat
+         marketplace-clone layout, `CLAUDE_PLUGIN_ROOT`, registry
+         `live_path`; see `_cdr_codename_free_root()` and module docstring.
+      2. Content-resident — `<content_root()>/coordinator/<dir_name>` (private
+         layout), falling back to `<content_root()>/<dir_name>` (OSS-flat
+         layout, F2 fix 2026-08-08 -- see below), delegating the
+         env/machine-local resolution to `coordinator_registry.content_root()`
+         (never reimplemented here — see module negative-spec).
+
+    Raises RuntimeError, naming `dir_name` and both candidate paths tried
+    (or the content-root resolution failure reason), if neither rung resolves to an
+    existing directory. Never returns a path that doesn't exist.
+    """
+    colocated = _colocated_root() / dir_name
+    if colocated.is_dir():
+        return colocated
+
+    private_candidate, flat_candidate = _doe_resident_candidates(dir_name, colocated)
+    if private_candidate.is_dir():
+        return private_candidate
+    if flat_candidate.is_dir():
+        return flat_candidate
+
+    raise RuntimeError(
+        f"coordinator_data_root: cannot resolve data dir {dir_name!r}. "
+        f"Rung 1 (co-located) tried: {colocated} (not found). "
+        f"Rung 2 (content-resident) tried: {private_candidate} (private layout, not found), "
+        f"{flat_candidate} (OSS-flat layout, not found)."
+    )
+
+
+def data_file(dir_name: str, *parts: str) -> Path:
+    colocated = _colocated_root() / dir_name
+    tried = [colocated.joinpath(*parts)]
+    if tried[0].is_file():
+        return tried[0]
+    for base in _doe_resident_candidates(dir_name, colocated):
+        candidate = base.joinpath(*parts)
+        if candidate.is_file():
+            return candidate
+        tried.append(candidate)
+    raise RuntimeError(
+        f"coordinator_data_root: cannot resolve {dir_name}/{'/'.join(parts)}; tried: "
+        + ", ".join(str(t) for t in tried)
+    )
+
+
+def _doe_resident_candidates(dir_name: str, colocated: Path) -> "tuple[Path, Path]":
+    root = _cdr_codename_free_root()
+
+    if not root:
+        from coordinator_registry import _DoeUnresolvable, content_root
+
+        try:
+            root = content_root()
+        except _DoeUnresolvable as exc:
+            raise RuntimeError(
+                f"coordinator_data_root: cannot resolve data dir {dir_name!r}. "
+                f"Rung 1 (co-located) tried: {colocated} (not found). "
+                f"Rung 2 (content-resident) failed: {exc}"
+            ) from exc
+
+    return Path(root) / "coordinator" / dir_name, Path(root) / dir_name
+
+
+FLAT_CONTENT_ROOT_MARKER = (".claude-plugin", "plugin.json")
+
+
+def content_root_for(repo_root) -> Path | None:
+    if not repo_root:
+        return None
+    if isinstance(repo_root, Path):
+        base = repo_root
+    else:
+        raw = str(repo_root)
+        base = Path(raw.rstrip("/\\") or raw)
+    private = base / "coordinator"
+    if private.is_dir():
+        return private
+    if base.joinpath(*FLAT_CONTENT_ROOT_MARKER).is_file():
+        return base
+    return None
+
+
+def content_root_or_private(repo_root) -> str:
+    content = content_root_for(repo_root)
+    if content is not None:
+        return str(content)
+    return os.path.join(str(repo_root), "coordinator")

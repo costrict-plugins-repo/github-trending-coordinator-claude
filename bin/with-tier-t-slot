@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""with-tier-t-slot — acquiring wrapper for one slot of the machine-wide
+Tier-T semaphore (coordinator_core.testing.tier_t_slots).
+
+WHY THIS EXISTS: check_test_suite_invocation's Tier-T legs can only ALLOW or
+DENY at the instant a command is submitted. A resource bound needs a third
+answer — "not yet, go ahead in a moment" — and a PreToolUse guard has no way to
+express it, because it is never told when a command it allowed has finished.
+This wrapper is where that answer lives: it blocks until a slot frees, runs the
+command, and releases on the way out. The guard's job reduces to requiring the
+wrapper; the counting happens here, where the command's lifetime is known.
+
+WAITING, NOT REFUSING, is the whole design. A dispatched agent denied for load
+has no good move: it retries, or it reports a failure that is really a queue.
+A fan-out of 876 scoped runs should COMPLETE, taking K at a time, and that is
+what this produces — the bound stops being something a caller can violate and
+becomes something it cannot perceive except as latency.
+
+Usage:
+    with-tier-t-slot [--owner-label LABEL] [--wait SECS] -- <command> [args...]
+
+    with-tier-t-slot -- python3 -m pytest path/test_x.py::test_case
+
+Every flag MUST appear before the -- separator; nothing after it is
+interpreted, matching with-suite-mutex's and scoped-git-commit's hard split.
+
+Negative spec:
+  - Does NOT parse, validate, or rewrite the wrapped command. It is not
+    runner-aware and must not become so; whether the command deserves a slot is
+    the guard's question, not this wrapper's.
+  - Does NOT impose a wall-clock ceiling on the child. with-suite-mutex needs
+    one because a wedged suite holds a fleet-wide mutex that nothing else can
+    break; here a wedged run's SLOT is reclaimed by SLOT_STALE_TTL_SECS
+    without touching the process, so the box keeps its K and the operator keeps
+    their runaway to debug. Killing a scoped test run is not this tool's call.
+  - On acquisition timeout it runs the command ANYWAY (fail OPEN) rather than
+    refusing, matching suite_mutex's take-side posture. A semaphore that turns
+    into an outage when the box is busy is worse than one that occasionally
+    admits K+1.
+  - Exit code is the child's, unmodified.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+from typing import List, Optional, Tuple
+
+
+def _wants_help(argv: List[str]) -> bool:
+    """True for `--help`/`-h` among this wrapper's own flags. Tokens after `--`
+    belong to the child: `with-tier-t-slot -- pytest -h` runs pytest's help."""
+    flags = argv[: argv.index("--")] if "--" in argv else argv
+    return "--help" in flags or "-h" in flags
+
+
+# `--help` exits 0 with usage on stdout, rather than joining
+# `percolate.engine._USAGE_NONZERO_ENTRYPOINTS`. That list exists for CLIs
+# whose `--help` reaches their own parser and exits non-zero, and its own
+# comment block records the cost of membership: the gate classifies ANY
+# non-zero exit from a listed entry as a usage hit, so a regression that
+# turns the CLI into one that crashes on startup is silently reported as a
+# PASS. Answering `--help` honestly keeps this entrypoint genuinely gated
+# instead of permanently excused.
+#
+# Answered BEFORE the engine bootstrap below: the entrypoint gate runs
+# `--help` with no machine-local registry, where `require_engine_on_path`
+# raises. Help text must not depend on an engine it does not use.
+if __name__ == "__main__" and _wants_help(sys.argv[1:]):
+    print(__doc__.strip())
+    sys.exit(0)
+
+_LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
+if _LIB_DIR not in sys.path:
+    sys.path.insert(0, _LIB_DIR)
+
+from cc_invoke import require_colocated_engine_on_path  # noqa: E402
+
+# Same bootstrap as with-suite-mutex: this file is also published into the
+# claude-klabauter mirror, where coordinator_core is not pip-installed and
+# sys.path[0] is this bin/ directory rather than a checkout root.
+#
+# COLOCATED, never the env-first `require_engine_on_path`. What this imports is
+# the engine's OWN test helper, so the right copy is the one belonging to the
+# checkout this file lives in -- which self-location answers and an environment
+# variable cannot. Env-first sent a run from the claude-klabauter checkout to whatever
+# COORDINATOR_ENGINE_ROOT named: on a cloud box that is a published mirror
+# pinned at clone time, two days and 266 engine commits behind, and the import
+# died on a helper that had not been published yet. The two-marker probe hits in
+# the mirror too (it carries coordinator_core/ and pyproject.toml), so the
+# published copy still resolves to the mirror, which is what it should do there.
+require_colocated_engine_on_path(__file__)
+
+from coordinator_core.testing import tier_t_slots  # noqa: E402
+from coordinator_core.win_portability import (  # noqa: E402
+    is_executable,
+    no_console_passthrough_kwargs,
+)
+
+_DEFAULT_OWNER_PREFIX = "with-tier-t-slot"
+
+# Win32-only: `CreateProcess` cannot launch a shebang-only POSIX shim
+# (extensionless `node_modules/.bin/<name>`, WinError 193) and cannot launch
+# a `.cmd`/`.bat` directly either -- both need a shell to mediate, and this
+# wrapper is a no-shell-out zone (EM ruling 2026-09-23, in response to
+# state/cross-repo/inbox/2026-09-23-example-cockpit-repo-em-with-tier-t-slot-cannot-launch-npm-bin-shims-on-win32.md:
+# no cmd.exe, no shell=True). The narrow shape that stays shell-free: `npm`'s
+# own `cmd-shim` writes a `.cmd` whose invocation line is
+# `"%_prog%"  "%dp0%\..\<pkg>\<entry>" %*` (older shims: `"%~dp0..\..."`) --
+# `%dp0%`/`%~dp0` is always the shim's OWN directory. Parsing that one line
+# for its JS target and launching `[node, <target>, *args]` directly is a
+# PLAIN_SPAWN, not a shell-out: no interpreter is asked to parse a command
+# line, we're just reading a known-format text file once.
+_WIN32_SHIM_EXTS = (".cmd", ".exe", ".bat")
+
+# Matches the target-script quoted argument on an npm cmd-shim's invocation
+# line: `"%dp0%\..\typescript\bin\tsc" %*` or the older `"%~dp0..\..."` form.
+# `%~?dp0%?\\?` absorbs either spelling and either zero or one extra
+# backslash (both `%dp0%` and `%~dp0` already end in a trailing backslash on
+# expansion, so the literal shim text sometimes carries one more, sometimes
+# not) before capturing the relative path up to the closing quote.
+_NPM_SHIM_TARGET_RE = re.compile(r'"%~?dp0%?\\?(?P<rel>[^"]+)"\s+%\*')
+
+
+def _win32_resolve_argv0(argv0: str) -> Optional[str]:
+    """Resolve `argv0` to an actual `CreateProcess`-launchable file on win32,
+    the way a shell's own PATHEXT resolution would -- reusing
+    `win_portability.is_executable` (already-correct PATHEXT logic) to judge
+    whether a candidate is directly launchable, rather than re-deriving that
+    check here. Returns None when nothing launchable is found.
+    """
+    if os.path.splitext(argv0)[1]:
+        # Already carries an extension: launchable iff is_executable() says
+        # so (a recognized PATHEXT suffix on an existing file) -- there is
+        # no PATHEXT sibling to fall back to for a name that already has its
+        # own, different extension.
+        return argv0 if is_executable(argv0) else None
+    for ext in _WIN32_SHIM_EXTS:
+        candidate = argv0 + ext
+        if is_executable(candidate):
+            return candidate
+    if not os.path.dirname(argv0):
+        # Bare command name -- fall back to a full PATH search, same as a
+        # shell would for an unqualified word.
+        found = shutil.which(argv0)
+        if found:
+            return found
+    return None
+
+
+def _parse_npm_cmd_shim(shim_path: str) -> Optional[str]:
+    """Read `shim_path` (an npm `cmd-shim`-generated `.cmd`) and resolve its
+    JS target to an absolute path, or None if the file isn't in the
+    recognized cmd-shim shape or the target doesn't exist on disk."""
+    try:
+        with open(shim_path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    match = None
+    for match in _NPM_SHIM_TARGET_RE.finditer(text):
+        pass  # last match wins: the invocation line, never the SET lines above it
+    if match is None:
+        return None
+    rel = match.group("rel").replace("\\", "/")
+    target = os.path.normpath(os.path.join(os.path.dirname(shim_path), rel))
+    return target if os.path.isfile(target) else None
+
+
+def _resolve_node_exe(shim_dir: str) -> str:
+    """The node binary an npm cmd-shim would itself prefer: a `node.exe`
+    sibling in the shim's own directory (cmd-shim's own `%dp0%\\node.exe`
+    check) if present, else whatever `node` resolves to on PATH."""
+    sibling = os.path.join(shim_dir, "node.exe")
+    if os.path.isfile(sibling):
+        return sibling
+    return shutil.which("node") or "node"
+
+
+def _win32_resolve_command(command: List[str]) -> Optional[List[str]]:
+    """Return `command` with argv[0] resolved for win32 launch, or None with
+    a one-line diagnostic already printed on stderr when nothing launchable
+    was found. No-op (returns `command` unchanged) on POSIX, where the OS
+    loader already honors the shebang directly.
+    """
+    if sys.platform != "win32":
+        return command
+
+    resolved = _win32_resolve_argv0(command[0])
+    if resolved is None:
+        print(
+            f"with-tier-t-slot: cannot resolve {command[0]!r} to a launchable "
+            "file on win32 (no matching .exe/.cmd/.bat found).",
+            file=sys.stderr,
+        )
+        return None
+
+    ext = os.path.splitext(resolved)[1].lower()
+    if ext == ".exe":
+        return [resolved, *command[1:]]
+    if ext in (".cmd", ".bat"):
+        target = _parse_npm_cmd_shim(resolved)
+        if target is None:
+            print(
+                f"with-tier-t-slot: {resolved!r} is a .cmd/.bat this wrapper cannot "
+                "launch without a shell, and isn't a recognizable npm cmd-shim. "
+                "Workaround: invoke `node <script>` directly instead.",
+                file=sys.stderr,
+            )
+            return None
+        return [_resolve_node_exe(os.path.dirname(resolved)), target, *command[1:]]
+
+    # Anything else _win32_resolve_argv0 handed back (e.g. an
+    # extensionless shebang shim with no .cmd/.exe/.bat sibling) is not
+    # launchable without a shell either.
+    print(
+        f"with-tier-t-slot: {resolved!r} has no recognized win32-launchable "
+        "shape (need .exe, or an npm .cmd/.bat shim). "
+        "Workaround: invoke `node <script>` directly instead.",
+        file=sys.stderr,
+    )
+    return None
+
+#: How long to wait for a slot before proceeding unserialized. Generous: the
+#: runs this bounds are short by construction, so a caller that waits this long
+#: is behind a genuinely full box rather than a wedged one, and the alternative
+#: to waiting is making the box worse.
+_DEFAULT_WAIT_SECS = 300.0
+
+_USAGE = (
+    "Usage: with-tier-t-slot [--owner-label LABEL] [--wait SECS] -- <command> [args...]"
+)
+
+
+def _install_signal_handlers() -> None:
+    """Route SIGTERM/SIGBREAK through KeyboardInterrupt so the slot is released
+    on every interrupt style, not only a literal Ctrl-C. Best-effort: a signal
+    absent on this platform is a silent no-op, never a startup failure.
+    """
+
+    def _handler(signum, frame):  # noqa: ANN001 - stdlib signal handler shape
+        raise KeyboardInterrupt()
+
+    for name in ("SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            pass
+
+
+def _parse_args(argv: List[str]) -> Tuple[Optional[str], float, List[str]]:
+    """Parse argv into (owner_label, wait_secs, command).
+
+    Returns (None, 0.0, []) with an error already printed on a malformed
+    invocation — no `--`, a `--` with nothing after it, or an unknown flag.
+    """
+    if "--" not in argv:
+        print(
+            "with-tier-t-slot: missing required `--` separator before the command.\n" + _USAGE,
+            file=sys.stderr,
+        )
+        return None, 0.0, []
+
+    sep = argv.index("--")
+    flags, command = argv[:sep], argv[sep + 1:]
+
+    if not command:
+        print(
+            "with-tier-t-slot: `--` must be followed by at least one command token.\n" + _USAGE,
+            file=sys.stderr,
+        )
+        return None, 0.0, []
+
+    owner_label: Optional[str] = None
+    wait = _DEFAULT_WAIT_SECS
+
+    def _parse_wait(raw: str) -> Optional[float]:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            print(f"with-tier-t-slot: --wait needs a number of seconds, got {raw!r}.", file=sys.stderr)
+            return None
+        if value < 0:
+            print("with-tier-t-slot: --wait cannot be negative.", file=sys.stderr)
+            return None
+        return value
+
+    i = 0
+    while i < len(flags):
+        flag = flags[i]
+        if flag == "--owner-label":
+            if i + 1 >= len(flags):
+                print("with-tier-t-slot: --owner-label requires a value.", file=sys.stderr)
+                return None, 0.0, []
+            owner_label, i = flags[i + 1], i + 2
+            continue
+        if flag.startswith("--owner-label="):
+            owner_label, i = flag.split("=", 1)[1], i + 1
+            continue
+        if flag == "--wait":
+            if i + 1 >= len(flags):
+                print("with-tier-t-slot: --wait requires a value.", file=sys.stderr)
+                return None, 0.0, []
+            parsed = _parse_wait(flags[i + 1])
+            if parsed is None:
+                return None, 0.0, []
+            wait, i = parsed, i + 2
+            continue
+        if flag.startswith("--wait="):
+            parsed = _parse_wait(flag.split("=", 1)[1])
+            if parsed is None:
+                return None, 0.0, []
+            wait, i = parsed, i + 1
+            continue
+        print(f"with-tier-t-slot: unrecognized flag {flag!r}.\n{_USAGE}", file=sys.stderr)
+        return None, 0.0, []
+
+    return owner_label, wait, command
+
+
+def main(argv: List[str]) -> int:
+    owner_label, wait, command = _parse_args(argv)
+    if not command:
+        return 2
+
+    launch_command = _win32_resolve_command(command)
+    if launch_command is None:
+        return 1
+
+    _install_signal_handlers()
+    owner = tier_t_slots.owner_id() if owner_label is None else owner_label
+    cmd_text = " ".join(command)
+
+    # Acquired around the child rather than inside it: the slot must be held
+    # for the child's whole lifetime, and `pid=` is handed the CHILD's pid so a
+    # slot is judged live against the process actually doing the work — the
+    # PID-LIVENESS contract in suite_mutex's module docstring, which this
+    # wrapper would otherwise violate by recording its own short-lived pid.
+    proc: Optional[subprocess.Popen] = None
+    slot = None
+    try:
+        proc = subprocess.Popen(launch_command, **no_console_passthrough_kwargs())
+        slot = tier_t_slots.acquire_slot(owner, cmd_text, wait, pid=proc.pid)
+        if slot is None:
+            taken, cap, _ = tier_t_slots.occupancy()
+            print(
+                f"with-tier-t-slot: no slot free after {wait:.0f}s ({taken}/{cap} taken) — "
+                "running unserialized rather than refusing.",
+                file=sys.stderr,
+            )
+        return proc.wait()
+    except KeyboardInterrupt:
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=10)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        return 130
+    finally:
+        if slot is not None:
+            tier_t_slots.release_slot(slot)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

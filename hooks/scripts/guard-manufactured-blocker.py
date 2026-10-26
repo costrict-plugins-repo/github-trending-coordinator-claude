@@ -1,0 +1,1136 @@
+"""Stop-hook guard — the manufactured-blocker check (off-altitude items in
+end-of-turn PM handoffs).
+
+Spec backlink: docs/plans/2026-08-10-posture-scaled-autonomous-disposition.md
+(chunk C5); "A fourth shape, and the one the ledger cannot see" in that plan's
+Problem section is the motivating incident this guard encodes.
+
+THE PROBLEM. An EM closed a turn: "Three things now wait on you: the cascade
+exit-code call (blocks the fix), the retro --write (now sequenced behind it),
+and the doctrine-plane negative-spec entry." The PM's reaction supplies the test this
+guard applies: "I don't even know what these things are, but I'm sure they're
+EM calls. It's the 'wait on you' and that sort of crap. No it doesn't. These
+are EM things." A second, subtler family says the same thing by assertion
+rather than by an overt handoff clause -- "genuinely yours", "still yours, and
+unchanged", "that's a PM call, not mine" -- tagging an item as PM-owned
+without demonstrating it is. The PM names this a tic: the possessive does the
+work no analysis did, and a softening qualifier ("genuinely", "actually",
+"still") is an AGGRAVATING signal, not a mitigating one.
+
+THE TEST -- copied, not re-derived. It exists as the plan skill's B.0
+doubt-check un-gaming clause, which disqualifies tactical uncertainties
+(naming, test framework, commit shape, file structure) as "off-altitude,
+not merely low-stakes", however unsure the author is. That clause has TWO
+route-keyed arms since the route segmentation -- the full triad in
+`plan-corpus.md`, a proportional falsifiability arm in
+`spec-dispatch-corpus.md` -- so cite it by name rather than by file: an
+S-lane EM never loads the `plan` segment, and a message naming a file its
+reader cannot open is worse than one naming none.
+
+This guard applies the same discriminator to
+end-of-turn reports: a genuine PM call concerns scope, deliverable, or
+product direction, and states itself in the PM's vocabulary. If the PM would
+not recognise the nouns, it is an EM call -- decide it, do not hand it up.
+
+WHY THIS IS NOT THE STOOD-DOWN WATCHER. `runtime-tripwire-stop-watcher.py`
+inferred a STATE ("is this session abandoned?") from timing and transcript
+shape, fired 681 times in 26 days at ~99.4% wrong, and was stood down by PM
+ruling. This guard matches a SPEECH ACT the EM literally wrote in its own
+final message -- the trigger text is right there in the output, nothing is
+inferred. No timing, idle-duration, or session-age predicate exists anywhere
+in this module (grep-asserted by the test suite, same discipline as A5).
+
+The one clock read is the go-ask advisory's Group EM heartbeat freshness
+(`state/group-em-watch.json`): it witnesses a peer's liveness, never this
+session's abandonment, and the advisory it gates cannot block.
+
+SCOPE OF THE READ. Stop hooks receive a transcript path. This module reads
+ONLY the final assistant message -- never the whole conversation -- which is
+what keeps it a cheap `command` hook.
+
+EXEMPTIONS ARE LOAD-BEARING (A13). A real PM gate must never be suppressed --
+a false fire here is worse than a miss, because it trains the EM to route
+around a genuine gate. Silent pass when any of these hold, checked against
+the same turn's sizing state and a SCOPED window of the final-message text
+(the sentence carrying the C5 trigger plus one sentence either side -- never
+the whole message; see EXEMPTION SCOPE below for why):
+  - the session's routed sizing object carries an unresolved appetite/post-
+    size fork (`fork: null` with the matching detent open) or an unresolved
+    XL exit (`route: pm-decision`, `xl_exit: null`) -- predicate copied from
+    the sibling engine's `nudge_unrouted_sizing` op (`_appetite_fork_open` /
+    `_post_size_prompt_open`), read through
+    `lib/frontmatter_scan.py` since this guard has no sibling engine op to delegate to.
+    Conjunctive with the trigger window, like the other lexical exemptions:
+    the on-disk fork must be open AND the C5 trigger sentence must itself be
+    about the size of the ask. An open post-size prompt exempts the sentence
+    that ASKS it -- never every possessive construct sharing the turn, which
+    would silence C5 for the whole of any session sized M or above, i.e. in
+    exactly the sessions whose reports carry multiple items. A recorded
+    `pm_resolution` block closes the fork on its own: the engine always emits
+    `fork` null and the schema fills it only on a cut-/raise-shaped answer,
+    so `fork` alone cannot witness a PM answer of "go with that";
+  - an ask-before-external-action is pending (an irreversible/external act
+    named without pre-authorization already granted);
+  - a conflict of interest / wrong signatory (the EM is structurally
+    disqualified from acting -- e.g. a two-decider record naming the EM as
+    one of the deciders, so the EM ratifying its own authorship is the wrong
+    signature regardless of how well it understands the content). Lexical,
+    two halves with DELIBERATELY DIFFERENT scope (A13 finding 1's
+    resolution): a standalone phrase ("wrong signature", "ratifying my own
+    authorship", "two-decider"/"named deciders" construct) is checked
+    against the scoped window like the other exemption above, since
+    the phrase is self-contained and its appearing far from the trigger is
+    exactly the incidental-co-occurrence failure mode this guard must not
+    reward. An authorship admission ("I wrote/authored it") co-occurring
+    with ratification vocabulary (sign-off/ratify/approve) is checked
+    against the WHOLE message on purpose and stays that way -- the
+    admission and the ratification ask legitimately sit in different
+    sentences of a real wrong-signatory report, so narrowing this half
+    would break genuine cases, not just incidental ones. Neither half alone
+    is enough, so an ordinary "I wrote the plan, so the approach call is
+    yours" still fires the ordinary handoff check.
+The exemption check applies identically to BOTH pattern groups below -- the
+discriminator is never the phrasing, it is whether one of these three actually
+holds.
+
+EXEMPTION SCOPE (A13 finding 1, live incident). The two lexical exemptions
+above were originally checked against the whole final message -- so an EM
+final message that both (a) genuinely hands an item to the PM and (b)
+separately mentions this guard's own exemption vocabulary while discussing
+something else entirely (e.g. summarizing the exemption list, or writing a
+retro about this very guard) got silently exempted, with no observable
+signal. `_trigger_window_text` narrows the check to the sentence carrying
+the actual C5 trigger plus one sentence of surrounding context on each
+side -- wide enough for a legitimate exemption phrasing that spans two
+adjacent sentences (e.g. "before I force-push, may I get your
+authorization? Your call --"), narrow enough that a mention several
+sentences away, for an unrelated reason, no longer silently exempts.
+
+SIZING EXEMPTION'S SECOND SCOPE (Chunk B, docs/plans/2026-08-11-stop-the-
+guard-splat.md; the section proven by direct execution against a
+reconstructed scenario matching the real on-disk sizing object's shape --
+no confirmed live guard fire is attributed to this gap). A turn that
+closes an appetite/post-size fork can legitimately report an UNRELATED PM
+item first (e.g. a genuine "your call" scope question) and only THEN ask
+the post-size prompt as its closing line -- the engine emits that prompt
+to CLOSE the turn, so it can land past the ±1-sentence trigger window.
+The sizing topic check therefore ALSO runs against the message's own
+final sentence (`_final_sentence`), but ONLY when that final sentence is
+the sentence immediately following the trigger window, with no
+intervening filler sentence -- never as an unconditional second location,
+and never merely because it falls outside the window. Consulting the
+final sentence whenever it is merely outside the window (regardless of
+distance) would let ANY final sentence carrying sizing vocabulary exempt
+the whole turn no matter how far from the trigger, reopening A13 finding
+1's incidental-co-occurrence failure mode at final-sentence scope; the
+adjacency requirement keeps it to the one structural shape this fix
+targets (trigger, its ±1 context, then the engine's own closing prompt
+immediately after).
+
+SEVERITY BY POSTURE: advisory (stdout, exit 0) at `precision`; blocking
+(stderr, exit 2, Stop-family shape) at `default`/`substrate-free`, matching
+`nudge-unrouted-sizing.py` and `nudge-harness-directive-dispatch.py` -- this
+applies to the altitude verdict (C5) only.
+
+SECOND VERDICT BRANCH (C6, A15-A17). C5 answers "is this the PM's call?".
+This branch answers what comes after a YES: "can the PM actually answer it
+as written?" -- checked once an item survives C5 (no trigger, or a triggered
+item that an A13 exemption cleared). Detection is lexical (module-level
+pattern data, same style as the two groups above): a bare identifier with no
+plain-language gloss, the choice named as a category ("a scope call") rather
+than stated, or no recommendation anywhere in the message. This branch is
+UNCONDITIONALLY advisory-only, hardcoded rather than posture-gated -- it
+never returns exit 2, at any posture. Suppressing a genuine PM decision for
+being worded badly is the one unrecoverable failure on this surface; the
+worst permitted outcome is that the EM restates it.
+
+TURN-INTENT STEP. Before the altitude verdict, every non-subagent stop runs
+`_turn_intent.decide` on the final message (`last_assistant_message`, else the
+transcript): a declared `<turn-intent>` tail is recorded to the session's
+`turn-intent.json`; a missing tail is blocked at most `BLOCK_CAP` times (own
+counter) and only in a session holding the EM role marker, then recorded as
+`source: heuristic` (label only, never a block). The block arms only under Cockpit
+(`_cockpit_session.under_cockpit()`): off Cockpit the step records and never blocks,
+even in a session that holds the marker. `stop_hook_active` does NOT
+exit this step -- the second block lands on a re-entered stop -- but it still
+exits the altitude verdict. The tail is stripped before the altitude regexes
+run.
+
+Contract:
+  stdin   -- Stop JSON (session_id, transcript_path, cwd, stop_hook_active, agent_id...)
+  stdout  -- the correction text, at posture `precision` only
+  stderr  -- the correction text, at posture `default`/`substrate-free` only,
+             then the turn-intent BLOCK_REASON when the tail is missing
+  exit 2  -- guard fires at a blocking posture, or the turn-intent tail is missing
+             (blocks the stop; stderr shown to Claude)
+  exit 0  -- every other path, including every failure path (fail-open)
+
+Graceful degradation: any failure to read stdin, parse the transcript, or
+resolve posture falls through to a silent exit 0 (posture resolution itself
+already fails open to "precision" -- see `_posture.py`).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _session_hub  # noqa: E402
+import _turn_intent  # noqa: E402
+import _cockpit_session  # noqa: E402
+from _session_hub import session_id_is_real as _session_id_is_real  # noqa: E402
+from _touch_record import _touch_lines  # noqa: E402
+from _posture import resolve_posture  # noqa: E402
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "lib"))
+from frontmatter_scan import read_text, scan_mapping  # noqa: E402
+
+try:
+    from _git_root_walk import git_root_walk  # noqa: E402
+    from _git_common_dir import resolve_git_common_dir  # noqa: E402
+except Exception:  # import failure degrades to the "cannot evaluate" path
+    def git_root_walk(start=None):  # type: ignore[misc]
+        return None
+
+    def resolve_git_common_dir(git_root):  # type: ignore[misc]
+        return ""
+
+
+
+# The overt handoff-to-PM construct -- the EM directly hands an item to the
+# PM ("wait on you", "your call", ...).
+_HANDOFF_PATTERNS = [
+    re.compile(r"\bwait(?:s|ing)?\s+on\s+you\b", re.IGNORECASE),
+    re.compile(r"\bblocks?\s+on\s+you\b", re.IGNORECASE),
+    re.compile(r"\byour\s+call\b", re.IGNORECASE),
+    re.compile(r"\bneeds?\s+your\s+(?:decision|input|sign-off)\b", re.IGNORECASE),
+    re.compile(r"\bover\s+to\s+you\b", re.IGNORECASE),
+    re.compile(r"\bnow\s+wait\s+on\s+you\b", re.IGNORECASE),
+]
+
+# The possessive form -- the EM tags an item as PM-owned by assertion
+# rather than demonstrating it. A softening qualifier ("genuinely",
+# "actually", "still") is an aggravating signal, not a mitigating one.
+_POSSESSIVE_PATTERNS = [
+    re.compile(r"\bgenuinely\s+yours\b", re.IGNORECASE),
+    re.compile(r"\bgenuinely\s+unresolved\b", re.IGNORECASE),
+    re.compile(r"\bstill\s+yours\b", re.IGNORECASE),
+    re.compile(r"\bone\s+item\s+that'?s\s+actually\s+yours\b", re.IGNORECASE),
+    re.compile(r"that'?s\s+a\s+PM\s+call,?\s*not\s+mine\b", re.IGNORECASE),
+    re.compile(r"\bis\s+yours\s+to\s+(?:decide|disposition|call)\b", re.IGNORECASE),
+]
+
+_PATTERN_GROUPS = (_HANDOFF_PATTERNS, _POSSESSIVE_PATTERNS)
+
+# The bare ownership cue -- a third, narrower group that catches a handoff
+# phrased too loosely for the first two groups ("...and it's yours.") but
+# still marks the sentence as a candidate PM-handoff for the C6 decidability
+# check below. Not itself an altitude verdict -- C5's own verdict is governed
+# solely by `_PATTERN_GROUPS` above, unchanged.
+_OWNERSHIP_CUE_PATTERNS = [
+    re.compile(r"\b(?:is|'s)\s+yours\b", re.IGNORECASE),
+    re.compile(r"\byours\s+to\s+\w+", re.IGNORECASE),
+]
+
+
+# A bare identifier with no plain-language gloss beside it: a chunk/AC id,
+# a plan slug, or a hex SHA/delivery id. Anchored to citation shapes
+# rather than a standalone `\bC\d+\b`/`\bA\d+\b`, which also matches
+# ordinary prose -- deliberately coarse, but this check is advisory-only
+# (never blocks), so the residual over-match is bounded to a spurious
+# nudge.
+_BARE_IDENTIFIER_PATTERNS = [
+    re.compile(r"\bchunk\s+C\d+\b", re.IGNORECASE),
+    re.compile(r"\bAC\s+A\d+\b", re.IGNORECASE),
+    re.compile(r"[(/]\s*[AC]\d+\b"),
+    re.compile(r"\bdocs/plans/\S+"),
+    re.compile(r"\b[0-9a-f]{7,40}\b", re.IGNORECASE),
+    re.compile(r"\b(?:dlv|pln)-\S+", re.IGNORECASE),
+]
+
+# The choice named as a CATEGORY rather than stated -- "a scope call", "a
+# product call", etc. -- with no statement of what the alternatives are.
+_CATEGORY_CALL_RE = re.compile(
+    r"\ba\s+(?:scope|product|direction|prioritization)\s+call\b", re.IGNORECASE
+)
+
+# Presence (not absence) of a recommendation -- checked against the whole
+# final message, since a recommendation need not sit in the same sentence
+# as the handoff clause.
+_RECOMMENDATION_RE = re.compile(
+    r"\bI\s+recommend\b"
+    r"|\bI'?d\s+suggest\b"
+    r"|\bI\s+would\s+suggest\b"
+    r"|\bmy\s+read\s+is\b"
+    r"|\bI\s+lean\b"
+    r"|\bunless\s+you'?d\s+rather\b"
+    r"|\bunless\s+you\s+would\s+rather\b",
+    re.IGNORECASE,
+)
+
+_DECIDABILITY_CORRECTION_TEXT = (
+    "[guard] This is a PM call, but not decidable as written -- presume zero "
+    "retained PM context: no bare identifiers up front, state the choice in "
+    "plain words, the options, and a recommendation with its cost (this "
+    "repo's reporting doctrine). Restate it so the PM can answer cold.\n"
+)
+
+
+# An irreversible/external act named without pre-authorization already
+# granted. Kept narrow rather than broad -- a false fire is worse than a
+# miss for this exemption.
+_EXTERNAL_ACTION_PENDING_RE = re.compile(
+    r"ask-before-external-action"
+    r"|external[- ]action\b.{0,40}\b(?:pending|awaiting|authoriz)"
+    r"|(?:may\s+i|requesting\s+(?:your\s+)?(?:authorization|permission))\b.{0,60}"
+    r"\b(?:push|force[- ]push|delete|deploy|merge|commit)\b"
+    r"|before\s+i\s+(?:push|force[- ]push|delete|deploy|commit)\b.{0,40}"
+    r"(?:\bok\b|\bokay\b|\bconfirm|authoriz|permission)",
+    re.IGNORECASE,
+)
+
+# The conflict-of-interest / wrong-signatory exemption: an item only the
+# PM can act on because the EM is structurally disqualified (a
+# two-decider record naming the EM as one of the deciders), not because of
+# scope or direction. Co-occurrence preferred over a single loose keyword
+# so an ordinary offload can't trivially borrow the phrasing.
+_WRONG_SIGNATORY_PATTERNS = [
+    re.compile(r"\bwrong\s+signat(?:ure|ory)\b", re.IGNORECASE),
+    re.compile(r"\bratify(?:ing)?\s+my\s+own\b", re.IGNORECASE),
+    re.compile(r"\bmy\s+own\s+authorship\b", re.IGNORECASE),
+    re.compile(r"\bapprove\s+my\s+own\b", re.IGNORECASE),
+    re.compile(r"\bsign(?:ing)?\s+off\s+on\s+my\s+own\b", re.IGNORECASE),
+    re.compile(r"\btwo-decider\b", re.IGNORECASE),
+    re.compile(r"\bnamed\s+deciders\b", re.IGNORECASE),
+    re.compile(r"\bthe\s+record'?s\s+deciders\b", re.IGNORECASE),
+    re.compile(r"\bboth\s+deciders\b", re.IGNORECASE),
+]
+
+# An authorship admission -- "I wrote/authored it" or "I am one of the named
+# deciders" -- co-occurring with ratification/sign-off vocabulary ANYWHERE in
+# the message. DELIBERATELY whole-message, not window-scoped (A13 finding 1):
+# a real wrong-signatory report legitimately states the admission and the
+# ratification ask in different sentences. Neither half alone is sufficient;
+# an ordinary "I wrote the plan, so the approach call is yours" carries the
+# admission half but no ratification vocabulary, so it must still fire the
+# ordinary handoff check.
+_AUTHORSHIP_ADMISSION_RE = re.compile(
+    r"\bI\s+(?:wrote|authored)\s+\S+\b"
+    r"|\bI(?:'m|\s+am)\s+one\s+of\s+the\s+named\s+deciders\b",
+    re.IGNORECASE,
+)
+
+_RATIFICATION_VOCAB_RE = re.compile(
+    r"\bsign[- ]?off\b|\bratif\w*\b|\bapprove\b", re.IGNORECASE
+)
+
+
+def _record_fire(repo_root: str, session_id: str, guard: str, reason: str) -> str | None:
+    """Mint a block-discharge nonce through the engine's ledger writer.
+    None when the engine is unresolvable or the write fails; the caller
+    reports that as an unrecorded fire, never as a clean check."""
+    try:
+        from _engine_root import place_engine_root_on_path, resolve_claude_klabauter_root
+
+        root = resolve_claude_klabauter_root()
+        if not root:
+            return None
+        place_engine_root_on_path(root)
+        from coordinator_core.block_discharge import record_fire
+    except Exception:
+        return None
+    return record_fire(repo_root, session_id, guard, reason)
+
+
+def _wrong_signatory_pending(scope: str, full_text: str) -> bool:
+    """`scope` is the A13 trigger window (narrow, incidental-co-occurrence
+    guarded); `full_text` is the whole final message, used only for the
+    admission+ratification co-occurrence half, which is deliberately
+    whole-message -- see `_AUTHORSHIP_ADMISSION_RE`'s comment."""
+    if any(pattern.search(scope) for pattern in _WRONG_SIGNATORY_PATTERNS):
+        return True
+    return bool(
+        _AUTHORSHIP_ADMISSION_RE.search(full_text)
+        and _RATIFICATION_VOCAB_RE.search(full_text)
+    )
+
+
+_SIZING_PATH_RE = re.compile(r"^state/sizings/[^/]+\.ya?ml$")
+
+_APPETITE_DIVERGENCE_DETENT = "appetite_exceeded"
+_POST_SIZE_PROMPT_DETENT = "post_size_prompt_pending"
+
+_TAIL_WINDOW_BYTES = 200_000
+
+_CORRECTION_TEXT = (
+    "[guard] This turn closed with a PM-handoff construct for an item the PM "
+    "would not recognise by its own nouns. Apply the altitude test "
+    "(the plan skill's B.0 un-gaming clause, on whichever route you loaded): "
+    "a genuine PM call concerns scope, deliverable, or product direction, "
+    "and states itself in the PM's vocabulary. If the PM would not recognise "
+    "the nouns, "
+    "it is an EM call -- decide it, do not hand it up. Re-close the turn "
+    "having resolved it yourself, or state the genuine PM-altitude question "
+    "plainly if one actually remains.\n"
+)
+
+
+def _tail_text(path: str, max_bytes: int = _TAIL_WINDOW_BYTES) -> str:
+    """Last `max_bytes` of `path`, decoded, or "" on any I/O failure.
+    Bounded binary-seek read -- this is the only read this module performs
+    against the transcript; the whole conversation is never scanned."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+                fh.readline()  # discard the partial line the seek landed inside
+            raw = fh.read()
+        return raw.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _final_assistant_text(transcript_path: str) -> str:
+    """Text of the final assistant message in the tail window, or "" --
+    never reasons about any earlier turn in the conversation."""
+    text = _tail_text(transcript_path)
+    if not text:
+        return ""
+    last_text = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "assistant":
+            continue
+        msg = entry.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        parts = [
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        # Always overwrite, never only-if-non-empty: a tool_use-only turn
+        # (no text block) must reset last_text to "", not silently retain an
+        # earlier turn's text -- the invariant is "final message only".
+        last_text = "\n".join(parts) if parts else ""
+    return last_text
+
+
+_NEGATION_BEFORE = re.compile(r"\b(?:nothing|no|not|never|none|\w+n't)\b(?:\s+[\w']+){0,3}\s*$", re.IGNORECASE)
+
+
+# Reported speech: the call is attributed to a named party or an existing ruling
+# ("Angelique ruled ...", "per the APM ruling", "the APM's call was") or sits in past tense
+# ("was your call"). Scoped to the text since the last sentence/semicolon/contrast boundary,
+# so a fresh handoff after "; but" still fires. Mirrors the engine twin's predicate.
+_ATTRIBUTION_RE = re.compile(
+    r"\b(?:ruled|rules|ruling|rulings|decided|determined|signed\s+off|approved|answered)\b"
+    r"|\bper\s+(?:the\s+)?[\w'-]+(?:\s+[\w'-]+)?\s+(?:call|decision|answer)\b"
+    r"|['’]s\s+(?:call|decision)\b",
+    re.IGNORECASE,
+)
+_PAST_COPULA_TAIL_RE = re.compile(r"\b(?:was|were|had\s+been)\s+$", re.IGNORECASE)
+_ATTRIBUTION_SCOPE_BOUNDARY_RE = re.compile(r"[.!?;\n]|\b(?:but|however|though|although)\b", re.IGNORECASE)
+_QUOTE_CHARS = "\"“”`"
+
+
+def _reported_speech(prefix: str) -> bool:
+    if _PAST_COPULA_TAIL_RE.search(prefix):
+        return True
+    boundaries = list(_ATTRIBUTION_SCOPE_BOUNDARY_RE.finditer(prefix))
+    scope = prefix[boundaries[-1].end():] if boundaries else prefix
+    return bool(_ATTRIBUTION_RE.search(scope))
+
+
+# A clause opening with a named third party -- a hyphenated session name carrying a digit
+# ("example-stats-repo-1f"), or "peer" / "session" / "Group EM" -- reports that party's state.
+_THIRD_PARTY_OPENER_RE = re.compile(
+    r"^\W*(?:(?:the|that|a|another|your|their)\s+)?"
+    r"(?:(?=[\w-]*\d)[a-z][a-z0-9]*(?:-[a-z0-9]+){2,}|peers?|sessions?|group\s+ems?)\b",
+    re.IGNORECASE,
+)
+_FIRST_PERSON_RE = re.compile(r"\b(?:I|we|this\s+session)\b|\b(?:I|we)['’]", re.IGNORECASE)
+
+
+def _third_party_clause(prefix: str) -> bool:
+    boundaries = list(_ATTRIBUTION_SCOPE_BOUNDARY_RE.finditer(prefix))
+    clause = prefix[boundaries[-1].end():] if boundaries else prefix
+    return bool(_THIRD_PARTY_OPENER_RE.match(clause)) and not _FIRST_PERSON_RE.search(clause)
+
+
+_DECLARED_OPERATOR_ACTION_RE = re.compile(
+    r"^[ \t]*(?:(?:[-*+>]|\d+[.)])[ \t]+)?(?:\*\*|__)?"
+    r"(?:hands-on[ \t]+task|operator[ \t]+action)[ \t]*:",
+    re.IGNORECASE,
+)
+
+
+def _strip_declared_operator_actions(text: str) -> str:
+    """Drop lines that declare an operator-only physical act (`Hands-on task:`
+    / `Operator action:`) so no trigger or decidability check reads them."""
+    return "\n".join(
+        ln for ln in text.split("\n") if not _DECLARED_OPERATOR_ACTION_RE.match(ln)
+    )
+
+
+def _inside_quote(prefix: str) -> bool:
+    line = prefix[prefix.rfind("\n") + 1:]
+    return sum(1 for ch in line if ch in _QUOTE_CHARS) % 2 == 1
+
+
+_PROGRESSIVE_WAIT_RE = re.compile(r"\bwaiting\s+on\s+you\b", re.IGNORECASE)
+_HANDOFF_REQUEST_RE = re.compile(
+    r"\?|\b(?:decide|decision|approve|approval|authori[sz]\w*|confirm|go-ahead|sign-off|your\s+(?:call|input|go)"
+    r"|please|need\s+you|can\s+you|could\s+you|let\s+me\s+know|tell\s+me|should\s+I|want\s+me)\b",
+    re.IGNORECASE,
+)
+_SENTENCE_BREAK_RE = re.compile(r"[.!?\n]")
+
+
+def _status_line_wait(text: str, start: int, end: int) -> bool:
+    """True when the progressive 'waiting on you' sits in a sentence that neither asks a
+    question nor requests a decision: a status line describing a gate, not a handoff."""
+    left = max((text.rfind(ch, 0, start) for ch in ".!?\n"), default=-1) + 1
+    tail = _SENTENCE_BREAK_RE.search(text, end)
+    right = tail.end() if tail else len(text)
+    if text[end:end + 1] == ":":
+        return False
+    return not _HANDOFF_REQUEST_RE.search(text[left:right])
+
+
+def _fires(pattern: "re.Pattern[str]", text: str) -> bool:
+    """A trigger match counts unless a negation sits within the three words before it in the
+    same clause ("Nothing is waiting on you" states no handoff exists), it sits inside a quoted
+    span on its line, it is reported speech, or it is a progressive "waiting on you" status line
+    with no question or decision request. Undecidable cases stay silent: a missed handoff
+    is cheaper than a false stop."""
+    for m in pattern.finditer(text):
+        prefix = text[:m.start()]
+        if _NEGATION_BEFORE.search(prefix[-60:]):
+            continue
+        if _PROGRESSIVE_WAIT_RE.fullmatch(m.group(0)) and _status_line_wait(text, m.start(), m.end()):
+            continue
+        if _inside_quote(prefix) or _reported_speech(prefix) or _third_party_clause(prefix):
+            continue
+        return True
+    return False
+
+
+def _matches_manufactured_blocker(text: str) -> bool:
+    for patterns in _PATTERN_GROUPS:
+        for pattern in patterns:
+            if _fires(pattern, text):
+                return True
+    return False
+
+
+_PATTERN_GROUP_NAMES = ("_HANDOFF_PATTERNS", "_POSSESSIVE_PATTERNS")
+
+
+def _matched_trigger_label(text: str) -> str | None:
+    """Diagnostic-only: name the group/pattern behind a C5 verdict so an
+    emitted correction can be checked against the predicate that fired.
+    Invariant: never consulted for the verdict -- it walks `_PATTERN_GROUPS`
+    in the same order as `_matches_manufactured_blocker`, so the two agree on
+    whether something matched and differ only in reporting which pattern."""
+    for name, patterns in zip(_PATTERN_GROUP_NAMES, _PATTERN_GROUPS):
+        for pattern in patterns:
+            if _fires(pattern, text):
+                return f"{name}:{pattern.pattern}"
+    return None
+
+
+def _external_action_pending(text: str) -> bool:
+    return bool(_EXTERNAL_ACTION_PENDING_RE.search(text))
+
+
+def _repo_root(payload: dict) -> str | None:
+    cwd = payload.get("cwd") or os.getcwd()
+    if not isinstance(cwd, str):
+        return None
+    return git_root_walk(cwd)
+
+
+def _is_null_scalar(value: str | None) -> bool:
+    return value is None or value in ("null", "~", "None", "")
+
+
+# The sizing exemption is topical, not turn-global: an open post-size
+# prompt exempts the sentence that ASKS it, never every possessive
+# construct sharing the turn. Matched generously -- an ambiguous sizing
+# sentence resolves toward silence.
+_SIZING_TOPIC_PATTERNS = [
+    re.compile(r"\bt-?shirt\b", re.IGNORECASE),
+    re.compile(r"\bappetite\b", re.IGNORECASE),
+    re.compile(r"\bxl[_ -]?exit\b", re.IGNORECASE),
+    re.compile(r"\bpm-decision\b", re.IGNORECASE),
+    re.compile(r"\b(?:XS|XL|XXL)\b"),
+    re.compile(r"\b(?:cut|split)\s+it\b", re.IGNORECASE),
+    re.compile(r"\bgo\s+with\s+that\b", re.IGNORECASE),
+    re.compile(r"\bmulti-session\b", re.IGNORECASE),
+    # Unambiguous sizing-gate vocabulary only -- bare `size`/`sized`/
+    # `sizing` was dropped: an ordinary word like "window size" carries no
+    # necessary connection to the PM sizing-gate.
+    re.compile(r"\bsizing\s+lobby\b", re.IGNORECASE),
+    re.compile(r"\bsized\s+it\b", re.IGNORECASE),
+    re.compile(r"\bpost_size_prompt\b", re.IGNORECASE),
+]
+
+
+def _sizing_topic_in_scope(scope: str) -> bool:
+    """True iff the trigger window is talking about the size of the ask --
+    the only subject an open post-size/XL-exit prompt can be about."""
+    return any(pattern.search(scope) for pattern in _SIZING_TOPIC_PATTERNS)
+
+
+def _sizing_object_exempts(repo_root: str, rel_path: str) -> bool:
+    """True iff the sizing object at `rel_path` carries an unresolved
+    appetite/post-size fork or an unresolved XL exit. Any read/parse
+    failure reads as "cannot prove the exemption doesn't apply" -> True ->
+    silence, matching a fail-toward-silence posture on every hard-exemption
+    read."""
+    text = read_text(os.path.join(repo_root, rel_path))
+    if text is None:
+        return True
+
+    m = scan_mapping(text)
+    route = m.get("route")
+    fork = m.get("fork")
+    xl_exit = m.get("xl_exit")
+    detents = m.get("detents")
+    if not isinstance(detents, list):
+        detents = []
+
+    # A recorded `pm_resolution` block IS the answer to the post-size
+    # prompt; `fork` alone cannot carry that signal since the engine emits
+    # it null unless the PM's answer happens to be cut- or raise-shaped.
+    if "pm_resolution" in m:
+        return False
+
+    fork_open = (
+        _APPETITE_DIVERGENCE_DETENT in detents or _POST_SIZE_PROMPT_DETENT in detents
+    ) and _is_null_scalar(fork)
+    xl_open = route == "pm-decision" and _is_null_scalar(xl_exit)
+    return fork_open or xl_open
+
+
+def _sizing_exemption_applies(payload: dict) -> bool:
+    """Outer preconditions (no session id, no resolvable repo root, no
+    `.git`, no `touched.txt` for this session) fail to False -- no
+    exemption -- deliberately not the fail-toward-True posture
+    `_sizing_object_exempts` uses on its own inner YAML read: failing open
+    here would exempt on every unresolvable-environment case regardless of
+    whether a sizing object was ever in play, a worse failure than the miss
+    this asymmetry accepts."""
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return False
+    repo_root = _repo_root(payload)
+    if repo_root is None:
+        return False
+    git_dir = resolve_git_common_dir(repo_root) or None
+    if not git_dir:
+        return False
+    sizing_paths = [
+        rel for rel in _touch_lines(git_dir, session_id) if _SIZING_PATH_RE.match(rel)
+    ]
+
+    return any(_sizing_object_exempts(repo_root, rel) for rel in sizing_paths)
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Coarse sentence split -- lexical, not linguistic. Good enough to
+    scope the bare-identifier / category-call checks to the sentence
+    carrying the handoff/possessive construct rather than the whole
+    message."""
+    pieces = re.split(r"(?<=[.!?])\s+|\n+", text)
+    return [p.strip() for p in pieces if p.strip()]
+
+
+def _trigger_window_idxs(text: str) -> tuple[list[str], set[int]]:
+    """Return `(sentences, window_idxs)` -- the sentence list and the set of
+    sentence indices in the A13 exemption-check scope (every sentence
+    carrying a C5 trigger, plus one sentence of context on each side; see
+    the module docstring's EXEMPTION SCOPE section). `window_idxs` is empty
+    when no trigger sentence is found."""
+    sentences = _split_sentences(text)
+    if not sentences:
+        return sentences, set()
+    trigger_idxs = set()
+    for i, sentence in enumerate(sentences):
+        for patterns in _PATTERN_GROUPS:
+            if any(_fires(pattern, sentence) for pattern in patterns):
+                trigger_idxs.add(i)
+                break
+    if not trigger_idxs:
+        return sentences, set()
+    window_idxs = set()
+    for i in trigger_idxs:
+        window_idxs.update(range(max(0, i - 1), min(len(sentences), i + 2)))
+    return sentences, window_idxs
+
+
+def _trigger_window_text(text: str) -> str:
+    """Falls back to the whole message if no trigger sentence is found --
+    defensive only; the caller reaches this after a trigger already
+    matched somewhere in the message."""
+    sentences, window_idxs = _trigger_window_idxs(text)
+    if not sentences or not window_idxs:
+        return text
+    return " ".join(sentences[i] for i in sorted(window_idxs))
+
+
+# EM-only markers (broad by design: a false positive here fails closed to the
+# altitude block): things a PM would not recognise by their own nouns. Detected
+# structurally (code/identifier shapes) plus a small lexicon of coordinator
+# machinery words. Drive-letter paths are deliberately NOT markers: they name
+# the PM's own disks.
+_EM_ONLY_MARKER_PATTERNS = [
+    re.compile(r"\b[AC]\d+\b"),
+    re.compile(r"\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+\b"),
+    re.compile(r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b"),
+    re.compile(r"\b\w+\(\)"),
+    re.compile(r"(?<![\w-])--[a-z][\w-]*"),
+    re.compile(r"\b[\w.-]+/[\w./-]+\.(?:py|md|ya?ml|json|sh|js|toml)\b"),
+    re.compile(r"\b\w[\w-]*\.(?:py|md|ya?ml|json|sh|js|toml)\b"),
+    re.compile(
+        r"\bexit[- ]codes?\b|\bnegative-spec\b|\bexecute-plan\b|\bauthorization\s+gate\b"
+        r"|\b(?:hook|guard|tripwire|sidecar|nonce|executor|subagent|worktree"
+        r"|frontmatter|dispatch(?:ed)?)s?\b",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _window_names_em_only_things(scope: str) -> bool:
+    """True when the A13 trigger window carries any EM-only marker (bare
+    identifiers, code shapes, repo paths, coordinator machinery words). The
+    altitude verdict's stated test: would the PM recognise these nouns."""
+    return any(_fires(p, scope) for p in _BARE_IDENTIFIER_PATTERNS) or any(
+        p.search(scope) for p in _EM_ONLY_MARKER_PATTERNS
+    )
+
+
+# A concrete quantity the PM can weigh (size, time, money). A bare "your call"
+# with no EM markers but nothing concrete is content-free, not plain-noun.
+_QUANTITY_RE = re.compile(
+    r"\d[\d,.]*\s*(?:[KMGT]i?B|%|hours?|hrs?|minutes?|mins?|days?|weeks?|seconds?)\b"
+    r"|[$£€]\s*\d",
+    re.IGNORECASE,
+)
+
+
+def _plain_noun_handoff(text: str) -> bool:
+    """A handoff whose trigger window states a concrete, quantified choice and
+    carries no EM-only marker. Reads the window only, never the whole message
+    (A13). The quantity requirement is deliberate: a quantity-free plain handoff
+    stays on the altitude block rather than passing as content-free."""
+    sentences, window_idxs = _trigger_window_idxs(text)
+    if not window_idxs:
+        return False
+    scope = " ".join(sentences[i] for i in sorted(window_idxs))
+    return bool(_QUANTITY_RE.search(scope)) and not _window_names_em_only_things(scope)
+
+
+def _any_exemption_applies(payload: dict, text: str) -> bool:
+    sentences, window_idxs = _trigger_window_idxs(text)
+    scope = " ".join(sentences[i] for i in sorted(window_idxs)) if window_idxs else text
+
+    # The final sentence is consulted for sizing vocabulary ONLY when it sits
+    # IMMEDIATELY after the trigger window with no intervening sentence --
+    # the structural shape an engine-emitted closing prompt produces
+    # (module docstring, SIZING EXEMPTION'S SECOND SCOPE): the window ends
+    # before the message does, and the final sentence is the very next one.
+    # Contiguity, not merely "outside the window", is the gate: without it,
+    # a trigger sentence far from the end with unrelated filler sentences in
+    # between would still let ANY final sentence carrying sizing vocabulary
+    # exempt the whole turn regardless of distance from the trigger -- the
+    # A13 incidental-co-occurrence failure mode this guard exists to close,
+    # reopened at final-sentence scope. Requiring adjacency narrows this to
+    # the one shape the fix targets (trigger, then immediate context, then
+    # the engine's own closing prompt) without accepting that residual risk.
+    final_idx = len(sentences) - 1 if sentences else -1
+    final_sentence_eligible = bool(window_idxs) and final_idx == max(window_idxs) + 1
+    sizing_in_scope = _sizing_topic_in_scope(scope) or (
+        final_sentence_eligible and _sizing_topic_in_scope(_final_sentence(text))
+    )
+    return (
+        _external_action_pending(scope)
+        or (sizing_in_scope and _sizing_exemption_applies(payload))
+        or _wrong_signatory_pending(scope, text)
+    )
+
+
+def _candidate_ownership_sentence(text: str) -> str | None:
+    """First sentence carrying a handoff/possessive/ownership construct, or
+    None if the message hands nothing to the PM at all."""
+    groups = (_HANDOFF_PATTERNS, _POSSESSIVE_PATTERNS, _OWNERSHIP_CUE_PATTERNS)
+    for sentence in _split_sentences(text):
+        for patterns in groups:
+            for pattern in patterns:
+                if _fires(pattern, sentence):
+                    return sentence
+    return None
+
+
+def _has_bare_identifier(sentence: str) -> bool:
+    return any(_fires(pattern, sentence) for pattern in _BARE_IDENTIFIER_PATTERNS)
+
+
+def _has_category_call(sentence: str) -> bool:
+    return bool(_CATEGORY_CALL_RE.search(sentence))
+
+
+def _has_recommendation(full_text: str) -> bool:
+    return bool(_RECOMMENDATION_RE.search(full_text))
+
+
+def _fails_decidability(sentence: str, full_text: str) -> bool:
+    """Any one of three signals is sufficient: a bare identifier with no
+    gloss, the choice named as a category rather than stated, or no
+    recommendation anywhere in the message."""
+    return (
+        _has_bare_identifier(sentence)
+        or _has_category_call(sentence)
+        or not _has_recommendation(full_text)
+    )
+
+
+# ---------------------------------------------------------------------------
+# C10 -- the declarative stall. The EM ends its turn having ANNOUNCED its next
+# action rather than taken it ("Proceeding with: A, then B, then C."), so the
+# work resumes only when the PM speaks. No question is asked and no second
+# person appears, so neither C5 group can see it; no tool is called, so the
+# AskUserQuestion nudge cannot; and a self-authored slate opens no ledger
+# obligation, so the next-move watchdog has nothing to leave undischarged.
+#
+# Matched ONLY against the final sentence. An intent stated mid-message and
+# then acted on in the same turn is a report, not a stall -- it is the
+# announcement in terminal position that makes the turn end on a promise.
+#
+# ADVISORY-ONLY by construction (see `_emit_declarative_stall_verdict`): this
+# is a speech act whose wrongness depends on whether the action was available,
+# which the guard cannot see. A13's "a false fire is worse than a miss" is
+# discharged by never blocking, not by narrowing until the tic escapes.
+# ---------------------------------------------------------------------------
+
+_DECLARATIVE_STALL_PATTERNS = [
+    re.compile(r"^\s*(?:now\s+|so\s+)?proceeding\s+with\b", re.IGNORECASE),
+    re.compile(r"^\s*(?:now\s+)?(?:starting|beginning)\s+(?:on|with|the)\b", re.IGNORECASE),
+    re.compile(
+        r"\bI'?ll\s+(?:now\s+)?(?:start|begin|get\s+on\s+with|move\s+on\s+to|"
+        r"crack\s+on\s+with|kick\s+off|pick\s+up)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bnext\s+(?:up\b|I'?ll\b)", re.IGNORECASE),
+    # The confessional subspecies -- the EM narrating its own course
+    # correction to the PM instead of simply correcting course.
+    re.compile(r"\bI'?ll\s+stop\s+\w+ing\b", re.IGNORECASE),
+]
+
+_DECLARATIVE_STALL_CORRECTION_TEXT = (
+    "[guard] This turn ends on an announcement of the next action rather than "
+    "the action. Announcing and stopping is a wait wearing the costume of "
+    "momentum: the work resumes only when the PM speaks, and the PM is "
+    "charged a turn for a result they did not receive. If the action was "
+    "available, take it and report what happened; if it was genuinely "
+    "blocked, name the blocker and your recommendation. "
+    "'Phase/wave/chunk boundaries are not stop boundaries' "
+    "(coordinator/snippets/em-operating-doctrine.md).\n"
+)
+
+
+def _final_sentence(text: str) -> str:
+    """Not fence/table-aware: a message ending on a trailing code-fence or
+    table line returns that line, not the prose above it."""
+    sentences = _split_sentences(text)
+    return sentences[-1] if sentences else ""
+
+
+# A bulleted or numbered continuation line -- "- x", "* x", "1. x". The
+# terminal-stall check strips these back to the line that introduces them,
+# since a hard newline split otherwise leaves the last list item as the
+# checked unit and the announcement itself (e.g. "Proceeding with:") goes
+# unseen.
+_BULLET_CONTINUATION_LINE_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+
+
+def _final_stall_unit(text: str) -> str:
+    """Text checked for a terminal announcement. Only the last paragraph
+    (text after the last blank line) is ever considered, and within it,
+    trailing bullet/numbered lines are walked back to the non-bullet line
+    that introduces them -- never merged across a paragraph break, never
+    pulled from mid-message. A paragraph with no trailing bullet lines
+    falls back to the ordinary final-sentence check."""
+    paragraphs = [p for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
+    if not paragraphs:
+        return ""
+    lines = [ln for ln in paragraphs[-1].splitlines() if ln.strip()]
+    if len(lines) > 1 and _BULLET_CONTINUATION_LINE_RE.match(lines[-1]):
+        idx = len(lines) - 1
+        while idx > 0 and _BULLET_CONTINUATION_LINE_RE.match(lines[idx]):
+            idx -= 1
+        if not _BULLET_CONTINUATION_LINE_RE.match(lines[idx]):
+            return lines[idx].strip()
+    return _final_sentence(text)
+
+
+def _is_declarative_stall(text: str) -> bool:
+    unit = _final_stall_unit(text)
+    if not unit:
+        return False
+    return any(pattern.search(unit) for pattern in _DECLARATIVE_STALL_PATTERNS)
+
+
+def _emit_declarative_stall_verdict(text: str) -> int:
+    """UNCONDITIONAL advisory-only, on the same hardcoded footing as
+    `_emit_decidability_verdict` -- never returns 2, at any posture."""
+    if _is_declarative_stall(text):
+        sys.stdout.write(_DECLARATIVE_STALL_CORRECTION_TEXT)
+    return 0
+
+
+def _emit_decidability_verdict(candidate: str, text: str) -> int:
+    """A17: UNCONDITIONAL advisory-only. Never returns 2, at any posture --
+    this is not a posture lookup a later edit could widen, it is hardcoded
+    here. A genuine PM call worded badly must never be suppressed."""
+    if _fails_decidability(candidate, text):
+        sys.stdout.write(_DECIDABILITY_CORRECTION_TEXT)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# The go-ask tail while a Group EM is live. The EM ends its report asking
+# for a go ("waiting on your go", "should I fix it?") although a live Group
+# EM holds the standing to decide. ADVISORY-ONLY by construction: a refusal
+# would force a rewrite where an edit-down is all the message needs. Matched
+# only against the message tail (last two sentences); gated on the Group EM
+# heartbeat at `state/group-em-watch.json`, so with no live holder it is
+# silent -- an unattended-PM session may legitimately end on a question.
+# ---------------------------------------------------------------------------
+
+_GO_ASK_PATTERNS = [
+    re.compile(
+        r"\b(?:waiting|awaiting|wait)\s+(?:on|for)\s+your\s+"
+        r"(?:go|go-ahead|say-so|word|nod|ok|okay|green\s*light)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bon\s+your\s+(?:go|go-ahead)\b", re.IGNORECASE),
+    re.compile(r"\bsay\s+(?:go|the\s+word)\b", re.IGNORECASE),
+    re.compile(r"\bgive\s+(?:me\s+)?the\s+(?:go|go-ahead|green\s*light)\b", re.IGNORECASE),
+    re.compile(r"\bready\s+when\s+you\s+are\b", re.IGNORECASE),
+    re.compile(
+        r"\bshould\s+I\s+(?:go\s+ahead|proceed|fix|ship|file|push|start|continue|do)\b[^.?!\n]*\?",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:want|would\s+you\s+like)\s+me\s+to\b[^.?!\n]*\?", re.IGNORECASE),
+]
+
+_GO_ASK_TAIL_SENTENCES = 2
+_GROUP_EM_WATCH_REL = ("state", "group-em-watch.json")
+_GROUP_EM_LIVE_SECONDS = 15 * 60
+
+_GO_ASK_ADVISORY_TEXT = (
+    "[guard] This turn ends asking for a go while a Group EM is live. Do not "
+    "wait on the PM: edit the tail down and act on your recommendation, or "
+    "route the question up to the live Group EM (and the APM for direction "
+    "calls). State what you did or will do, not what you are waiting for.\n"
+)
+
+
+def _go_ask_tail(text: str) -> bool:
+    tail = _split_sentences(text)[-_GO_ASK_TAIL_SENTENCES:]
+    return any(_fires(p, s) for s in tail for p in _GO_ASK_PATTERNS)
+
+
+def _group_em_live(payload: dict) -> bool:
+    """True iff the watch heartbeat names a holder and was ticked within
+    `_GROUP_EM_LIVE_SECONDS`. Any read/parse failure is "not live"."""
+    from datetime import datetime, timezone
+
+    try:
+        repo_root = _repo_root(payload)
+        if repo_root is None:
+            return False
+        with open(os.path.join(repo_root, *_GROUP_EM_WATCH_REL), encoding="utf-8") as fh:
+            watch = json.load(fh)
+        if not isinstance(watch, dict) or not str(watch.get("holder_session_id") or "").strip():
+            return False
+        ticked = datetime.fromisoformat(str(watch["last_tick_at"]).replace("Z", "+00:00"))
+        if ticked.tzinfo is None:
+            ticked = ticked.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - ticked).total_seconds()
+        return age <= _GROUP_EM_LIVE_SECONDS
+    except Exception:
+        return False
+
+
+def _emit_go_ask_advisory(payload: dict, text: str) -> None:
+    """Never affects the exit status; writes the advisory to stdout only."""
+    if _go_ask_tail(text) and _group_em_live(payload):
+        sys.stdout.write(_GO_ASK_ADVISORY_TEXT)
+
+
+def _heuristic_turn_intent(text: str) -> tuple[bool, str]:
+    """Label-only classifier for a turn that declared no intent: needs_pm iff
+    a shipped handoff/go-ask/ownership pattern fires; ask is that sentence."""
+    candidate = _candidate_ownership_sentence(text)
+    if candidate is not None:
+        return True, candidate[:_turn_intent.ASK_MAX]
+    for sentence in _split_sentences(text)[-_GO_ASK_TAIL_SENTENCES:]:
+        if any(_fires(p, sentence) for p in _GO_ASK_PATTERNS):
+            return True, sentence[:_turn_intent.ASK_MAX]
+    return (True, "") if _matches_manufactured_blocker(text) else (False, "")
+
+
+def _turn_intent_step(payload: dict, text: str) -> bool:
+    """Record this stop's turn intent; True iff the stop must be blocked for a
+    missing tail. Blocks only with a role marker and a durable counter."""
+    session_id = payload.get("session_id")
+    cwd = payload.get("cwd")
+    if not text.strip() or not isinstance(cwd, str) or not cwd:
+        return False
+    if not _session_id_is_real(session_id):
+        return False
+    git_root = git_root_walk(cwd)
+    git_dir = resolve_git_common_dir(git_root) if git_root else ""
+    if not git_dir:
+        return False
+    directory = _turn_intent.session_dir(git_dir, session_id)
+    if not _session_hub.ensure_session_dir(directory, session_id):
+        return False
+    decision = _turn_intent.decide(
+        text,
+        _turn_intent.read_blocks(directory),
+        # A session started under Cockpit and resumed in a terminal keeps its marker, so the marker alone is not the gate.
+        _turn_intent.role_marker_present(directory) and _cockpit_session.under_cockpit(),
+        _heuristic_turn_intent,
+    )
+    if decision.block:
+        count = _turn_intent.bump_blocks(directory)
+        return _turn_intent.read_blocks(directory) == count
+    if decision.record is not None:
+        needs_pm, ask, source = decision.record
+        _turn_intent.write_record(directory, session_id, needs_pm, ask, source, time.time())
+    return False
+
+
+def _altitude_verdict(payload: dict, text: str) -> int:
+    _emit_go_ask_advisory(payload, text)
+
+    if not _matches_manufactured_blocker(text):
+        # No off-altitude handoff triggered here. The message may still be
+        # a genuinely PM-owned item worded as a bare ownership cue -- check
+        # decidability on that candidate sentence; no candidate -> silent.
+        # The terminal-stall check runs only on this path (not the blocking
+        # one) and only when no ownership candidate exists, so a message
+        # never carries both advisories in the same turn.
+        candidate = _candidate_ownership_sentence(text)
+        if candidate is None:
+            return _emit_declarative_stall_verdict(text)
+        return _emit_decidability_verdict(candidate, text)
+
+    if _any_exemption_applies(payload, text) or _plain_noun_handoff(text):
+        # ALTITUDE PASSED (A13 exemption -- a real PM gate). Ordering (A15):
+        # altitude first, decidability second. This item survived C5; now C6
+        # asks whether the PM can actually answer it as written.
+        candidate = _candidate_ownership_sentence(text) or text
+        return _emit_decidability_verdict(candidate, text)
+
+    matched_label = _matched_trigger_label(text)
+    matched_note = f"[guard] matched: {matched_label}\n" if matched_label else ""
+    correction_text = _CORRECTION_TEXT + matched_note
+
+    try:
+        posture = resolve_posture()
+    except Exception:
+        posture = "precision"
+
+    if posture in ("default", "substrate-free"):
+        session_id = payload.get("session_id")
+        if not isinstance(session_id, str) or not session_id.strip():
+            session_id = "unknown-session"
+        repo_root = _repo_root(payload)
+        if repo_root is not None:
+            nonce = _record_fire(
+                repo_root, session_id, "guard-manufactured-blocker", correction_text
+            )
+        else:
+            nonce = None
+        if nonce is not None:
+            discharge_note = (
+                f"Recorded as {nonce}. When you have acted on this, run:\n"
+                f'  block-discharge record --nonce {nonce} '
+                f'--action "<what you did>" --repo-root "{repo_root}"\n'
+            )
+        else:
+            discharge_note = (
+                f"Could not record this fire (engine unresolvable or write failed) at "
+                f"state/block-discharge/{session_id}.jsonl.\n"
+                "No nonce to discharge -- this failure is visible in stderr, not "
+                "laundered into a clean check.\n"
+            )
+            sys.stderr.write(
+                "[guard] guard-manufactured-blocker: record_fire write failed, "
+                "no nonce minted\n"
+            )
+        sys.stderr.write(correction_text + discharge_note)
+        return 2
+
+    sys.stdout.write(correction_text)
+    return 0
+
+
+def main() -> int:
+    try:
+        raw = sys.stdin.read()
+    except Exception:
+        return 0
+
+    try:
+        payload = json.loads(raw) if raw else {}
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+
+    if payload.get("agent_id"):
+        return 0
+
+    transcript_path = payload.get("transcript_path")
+    has_transcript = isinstance(transcript_path, str) and bool(transcript_path)
+    transcript_text = _final_assistant_text(transcript_path) if has_transcript else ""
+    last_message = payload.get("last_assistant_message")
+    intent_text = last_message if isinstance(last_message, str) and last_message.strip() else transcript_text
+
+    try:
+        intent_block = _turn_intent_step(payload, intent_text)
+    except Exception:
+        intent_block = False
+
+    altitude_rc = 0
+    if not payload.get("stop_hook_active") and has_transcript:
+        text = _strip_declared_operator_actions(_turn_intent.strip_marker(transcript_text))
+        if text.strip():
+            altitude_rc = _altitude_verdict(payload, text)
+
+    if intent_block:
+        sys.stderr.write(("\n" if altitude_rc == 2 else "") + _turn_intent.BLOCK_REASON + "\n")
+        return 2
+    return altitude_rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

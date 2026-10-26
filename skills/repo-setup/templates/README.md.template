@@ -1,0 +1,28 @@
+# [PROJECT_NAME] — Documentation Index
+
+Central entry point for all project documentation. Maintained by `/update-docs`.
+
+---
+
+## Wikis and Guides
+→ **[`docs/wiki/DIRECTORY_GUIDE.md`](docs/wiki/DIRECTORY_GUIDE.md)** — full guide index
+_No guides yet. Created by `/distill` as knowledge accumulates._
+
+---
+
+## Plans
+→ [`docs/plans/`](plans/) — plans start in `~/.claude/plans/`, copied here on approval.
+
+---
+
+## Research
+→ [`docs/research/`](research/) — `/coordinator:research` outputs; key findings extracted by `/distill`.
+
+---
+
+## Reference Documentation
+| Doc | Purpose |
+|-----|---------|
+
+---
+*Last updated: [DATE]. Maintained by `/update-docs`.*

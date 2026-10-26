@@ -1,0 +1,450 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://coordinator.local/schemas/review-stage.schema.json",
+  "x-schema-name": "review-stage",
+  "x-schema-version": "1.9.0",
+  "x-bump-class": "nested-field-additive",
+  "x-bump-note": "1.8.0 -> 1.9.0 adds the optional terminal-judge-result property `differs_from_baseline`; the met branch of terminal-judge-verdict-rules admits falsifier verdict `error` only when it is true; no required list changed. Prior: 1.7.0 -> 1.8.0 adds the optional terminal-judge-result properties `completion_summary`, `lesson_candidates` and `authored_by`; no required list changed. Prior: 1.6.0 -> 1.7.0 adds `visual` to the `register_rows[].surface` enum. Hold: claude-klabauter re-vendors 1.7.0 (E1). Spec: docs/plans/2026-10-12-pm-instructions-enforced-end-to-end.md § C1. Prior: 1.5.0 -> 1.6.0 adds the optional terminal-judge-result property `register_rows`, the `register-source` member of `pm_words_read.source`, a terminal-judge-verdict-rules clause forcing not_met when a met result holds an unruled unclaimed row or a this-plan row not met and wired, and the evidence-order sentence in the terminal-judge-result description (docs/plans/2026-10-09-requirement-register-doe.md C1); no required list changed. Prior-version history: coordinator/schemas/SCHEMA-BUMP-HISTORY.md § review-stage.schema.json.",
+  "description": "Structured returns for the execute-review stage (docs/plans/2026-09-27-review-inside-execute-plan.md § Contract). the engine repo's compose_execute_review injects the relevant $def as each agent call's schema. Never applies_to a sidecar file directly -- these are dispatch RETURN shapes, validated in-process by the caller, not documents on disk.",
+  "$defs": {
+    "anchor": {
+      "type": "object",
+      "description": "A pointer into a sidecar, never the finding itself.",
+      "required": ["line", "anchor"],
+      "additionalProperties": false,
+      "properties": {
+        "line": { "type": "integer", "minimum": 1 },
+        "anchor": { "type": "string", "maxLength": 300 }
+      }
+    },
+    "brief-conformance-row": {
+      "type": "object",
+      "description": "One line of brief-conformance bookkeeping: does the diff satisfy one verbatim item from the plan's PM brief or prime_exit_criterion.",
+      "required": ["brief_item", "requirement", "file_line", "verified_how", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "brief_item": {
+          "type": "string",
+          "maxLength": 300,
+          "description": "Verbatim quote from the plan's ## PM brief or prime_exit_criterion.statement."
+        },
+        "requirement": { "type": "string", "maxLength": 200 },
+        "file_line": { "type": "string", "maxLength": 200 },
+        "verified_how": { "type": "string", "maxLength": 200 },
+        "status": { "type": "string", "enum": ["met", "partial", "unmet"] }
+      }
+    },
+    "review-prep-result": {
+      "type": "object",
+      "description": "The mechanical prep stage's return: the worktree-mode partition plus every sidecar path the rest of the wave reads. basis is always worktree -- there is no pre-review commit and no head SHA.",
+      "required": [
+        "plan_id", "share_dir", "verdict", "basis", "run_base_sha", "whole_diff_path",
+        "product_files", "foreign_claims", "slices", "whole_diff_sidecars"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "plan_id": { "type": "string", "maxLength": 200 },
+        "share_dir": { "type": "string", "maxLength": 300 },
+        "verdict": { "type": "string", "enum": ["PARTITION-MANDATORY", "single-reviewer-ok"] },
+        "basis": { "type": "string", "const": "worktree" },
+        "run_base_sha": { "type": "string", "pattern": "^[0-9a-f]{4,64}$" },
+        "sidecar_path": { "type": "string", "maxLength": 300 },
+        "whole_diff_path": { "type": "string", "maxLength": 300 },
+        "product_files": { "type": "integer", "minimum": 0 },
+        "foreign_claims": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 300 }
+        },
+        "slices": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "files", "diff_path", "sidecar_path", "contract_blocks"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string", "maxLength": 200 },
+              "files": { "type": "array", "items": { "type": "string", "maxLength": 300 } },
+              "diff_path": { "type": "string", "maxLength": 300 },
+              "sidecar_path": { "type": "string", "maxLength": 300 },
+              "contract_blocks": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "whole_diff_sidecars": {
+          "type": "object",
+          "required": ["kira", "personas", "delivery"],
+          "additionalProperties": false,
+          "properties": {
+            "kira": { "type": "string", "maxLength": 300 },
+            "personas": { "type": "array", "items": { "type": "string", "maxLength": 300 } },
+            "delivery": { "type": "string", "maxLength": 300 }
+          }
+        }
+      }
+    },
+    "slice-review-result": {
+      "type": "object",
+      "description": "One slice-owning code-reviewer's return. findings/applied/out_of_slice are COUNTS -- the findings themselves live in the sidecar the ledger already tracks.",
+      "required": [
+        "slice_id", "sidecar_path", "verdict", "findings", "applied", "out_of_slice",
+        "em_may_think_differently", "brief_conformance"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "slice_id": { "type": "string", "maxLength": 200 },
+        "sidecar_path": { "type": "string", "maxLength": 300 },
+        "verdict": { "type": "string", "enum": ["OK", "WARN", "BLOCKED"] },
+        "findings": { "type": "integer", "minimum": 0 },
+        "applied": { "type": "integer", "minimum": 0 },
+        "out_of_slice": { "type": "integer", "minimum": 0 },
+        "em_may_think_differently": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/anchor" }
+        },
+        "brief_conformance": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/brief-conformance-row" }
+        }
+      }
+    },
+    "whole-diff-review-result": {
+      "type": "object",
+      "description": "A findings-only whole-diff lens (Kira or a signal-named persona). applies nothing itself in this stage.",
+      "required": ["sidecar_path", "agent_type", "verdict", "findings", "rebuild_recommended", "em_may_think_differently"],
+      "additionalProperties": false,
+      "properties": {
+        "sidecar_path": { "type": "string", "maxLength": 300 },
+        "agent_type": { "type": "string", "maxLength": 200 },
+        "verdict": { "type": "string", "enum": ["APPROVED", "APPROVED_WITH_NOTES", "REQUIRES_CHANGES", "REJECTED"] },
+        "findings": { "type": "integer", "minimum": 0 },
+        "rebuild_recommended": { "type": "boolean" },
+        "em_may_think_differently": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/anchor" }
+        }
+      }
+    },
+    "delivery-verdict": {
+      "type": "object",
+      "description": "The delivery verifier's return: every executor delivery claim checked against the frozen diff.",
+      "required": ["sidecar_path", "verdict", "product_files", "claims_checked", "claims_unbacked"],
+      "additionalProperties": false,
+      "properties": {
+        "sidecar_path": { "type": "string", "maxLength": 300 },
+        "verdict": { "type": "string", "enum": ["PASS", "FAIL"] },
+        "product_files": { "type": "integer", "minimum": 0 },
+        "claims_checked": { "type": "integer", "minimum": 0 },
+        "claims_unbacked": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["claim", "anchor"],
+            "additionalProperties": false,
+            "properties": {
+              "claim": { "type": "string", "maxLength": 200 },
+              "anchor": { "type": "string", "maxLength": 300 }
+            }
+          }
+        }
+      }
+    },
+    "review-integration-result": {
+      "type": "object",
+      "description": "The single integration pass's return. fixes_applied/slice_ledgers_verified/confinement_violations are counts. unresolved is where an unresolvable finding goes -- to the PM, never to a second review round.",
+      "required": [
+        "plan_id", "prep_sidecar", "sidecar_path", "fixes_applied", "slice_ledgers_verified",
+        "confinement_violations", "em_may_think_differently", "unresolved",
+        "brief_conformance", "rebuild_decision"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "plan_id": { "type": "string", "maxLength": 200 },
+        "prep_sidecar": { "type": "string", "maxLength": 300 },
+        "sidecar_path": { "type": "string", "maxLength": 300 },
+        "fixes_applied": { "type": "integer", "minimum": 0 },
+        "slice_ledgers_verified": { "type": "integer", "minimum": 0 },
+        "confinement_violations": { "type": "integer", "minimum": 0 },
+        "em_may_think_differently": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/anchor" }
+        },
+        "unresolved": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/anchor" }
+        },
+        "brief_conformance": {
+          "type": "object",
+          "required": ["items", "met", "partial", "unmet", "unmet_items"],
+          "additionalProperties": false,
+          "properties": {
+            "items": { "type": "integer", "minimum": 0 },
+            "met": { "type": "integer", "minimum": 0 },
+            "partial": { "type": "integer", "minimum": 0 },
+            "unmet": { "type": "integer", "minimum": 0 },
+            "unmet_items": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/anchor" }
+            }
+          }
+        },
+        "rebuild_decision": {
+          "anyOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/anchor" }
+          ]
+        }
+      }
+    },
+    "terminal-judge-result": {
+      "type": "object",
+      "description": "The terminal exit-criterion judge's return. status, observation and sidecar_path are the three fields the engine's reader consumes. Counts and anchors only; the judge's full reasoning lives in its sidecar. Evidence order: the human's verbatims first (register source text, then the PM's words on the sizing: intent and the accepted quote or ruling), the exit criteria second (prime first, then gated), the plan text third, read but never outranking the first two.",
+      "required": ["status", "observation", "sidecar_path", "observed", "clauses", "falsifier", "gated", "pm_words_read", "contamination"],
+      "additionalProperties": false,
+      "properties": {
+        "status": { "type": "string", "enum": ["met", "not_met", "indeterminate"] },
+        "observation": { "type": "string", "maxLength": 200 },
+        "differs_from_baseline": { "type": "boolean" },
+        "sidecar_path": { "type": "string", "maxLength": 300 },
+        "completion_summary": { "type": "string", "maxLength": 600 },
+        "lesson_candidates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["title", "body", "change_kind", "target_wiki"],
+            "additionalProperties": false,
+            "properties": {
+              "title": { "type": "string" },
+              "body": { "type": "string" },
+              "change_kind": { "type": "string" },
+              "target_wiki": { "type": "string" }
+            }
+          }
+        },
+        "authored_by": { "type": "string", "enum": ["terminal-judge"] },
+        "observed": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["kind", "ref", "result"],
+            "additionalProperties": false,
+            "properties": {
+              "kind": { "type": "string", "enum": ["command", "path"] },
+              "ref": { "type": "string", "maxLength": 300 },
+              "result": { "type": "string", "maxLength": 200 },
+              "provenance": {
+                "type": "string",
+                "enum": ["judge", "em-recorded"],
+                "description": "judge: the judge ran or read it. em-recorded: the plan's committed Verification record, weighed for a guard-denied leg, not re-observed. Absent reads as judge."
+              }
+            }
+          }
+        },
+        "clauses": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["clause", "status", "observed_ref"],
+            "additionalProperties": false,
+            "properties": {
+              "clause": { "type": "string", "maxLength": 200 },
+              "status": { "type": "string", "enum": ["met", "not_met", "indeterminate"] },
+              "observed_ref": { "type": "string", "maxLength": 300 }
+            }
+          }
+        },
+        "falsifier": {
+          "type": "object",
+          "required": ["present", "ran", "verdict", "output_anchor"],
+          "additionalProperties": false,
+          "properties": {
+            "present": { "type": "boolean" },
+            "ran": { "type": "boolean" },
+            "verdict": { "type": "string", "enum": ["pass", "fail", "error", "not_present"] },
+            "output_anchor": { "type": "string", "maxLength": 300 }
+          }
+        },
+        "gated": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["brightline", "status", "evidence"],
+            "additionalProperties": false,
+            "properties": {
+              "brightline": {
+                "type": "string",
+                "enum": [
+                  "work-proportionate-to-question",
+                  "multi-os-first-class",
+                  "no-single-machine-assumptions",
+                  "work-vs-question-ratio",
+                  "right-not-merely-working"
+                ]
+              },
+              "status": { "type": "string", "enum": ["met", "not_met", "indeterminate"] },
+              "evidence": { "type": "string", "maxLength": 1024 }
+            }
+          }
+        },
+        "pm_words_read": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["source", "ref"],
+            "additionalProperties": false,
+            "properties": {
+              "source": { "type": "string", "enum": ["pm-brief", "execution-utterance", "sizing-intent", "accepted-pm-quote", "register-source"] },
+              "ref": { "type": "string", "maxLength": 300 }
+            }
+          }
+        },
+        "contamination": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 300 }
+        },
+        "reason": { "type": "string", "maxLength": 200 },
+        "register_rows": {
+          "type": "array",
+          "description": "Present when the plan or its sizing carries a requirement register: one entry per row the judge weighed. Anchors only.",
+          "items": {
+            "type": "object",
+            "required": ["id", "claim", "status", "wired"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string", "maxLength": 100 },
+              "claim": { "type": "string", "enum": ["this-plan", "other-plan", "unclaimed"] },
+              "status": { "type": "string", "enum": ["open", "partial", "met", "deferred", "waived"] },
+              "wired": { "type": "boolean" },
+              "surface": { "type": "string", "enum": ["ui", "api", "cli", "internal", "visual"] },
+              "observed_ref": { "type": "string", "maxLength": 300 },
+              "ruling_ref": { "type": "string", "maxLength": 300 }
+            }
+          }
+        },
+        "reachability": {
+          "type": "object",
+          "description": "Present only when the judge ran the reachability op; absent means the hand-trace fallback. Anchors only.",
+          "required": ["unreachable", "broken_click_paths", "undecidable"],
+          "additionalProperties": false,
+          "properties": {
+            "unreachable": { "type": "array", "items": { "type": "string", "maxLength": 300 } },
+            "broken_click_paths": { "type": "array", "items": { "type": "string", "maxLength": 300 } },
+            "undecidable": { "type": "array", "items": { "type": "string", "maxLength": 300 } }
+          }
+        }
+      }
+    },
+    "reachability-result": {
+      "type": "object",
+      "description": "The reachability op's result over a diff's entry points and declared click paths. The judge runs the op itself, so there is no provenance to authenticate.",
+      "required": ["entries", "click_paths", "summary", "cost"],
+      "additionalProperties": false,
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["kind", "ref", "verdict"],
+            "additionalProperties": false,
+            "properties": {
+              "kind": { "type": "string", "enum": ["exported-function", "cli", "hook", "api-route", "page"] },
+              "ref": { "type": "string", "maxLength": 300 },
+              "verdict": { "type": "string", "enum": ["reachable", "unreachable", "undecidable"] }
+            }
+          }
+        },
+        "click_paths": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["role", "verdict", "broken_at"],
+            "additionalProperties": false,
+            "properties": {
+              "role": { "type": "string", "maxLength": 200 },
+              "verdict": { "type": "string", "enum": ["reachable", "broken", "undecidable"] },
+              "broken_at": { "type": ["string", "null"], "maxLength": 300 }
+            }
+          }
+        },
+        "summary": { "type": "string", "maxLength": 300 },
+        "cost": { "type": "object" },
+        "error": { "type": ["string", "null"], "maxLength": 300 }
+      }
+    },
+    "terminal-judge-verdict-rules": {
+      "description": "Cross-field rules over a terminal-judge-result, applied post hoc beside it. Kept out of terminal-judge-result because a tool input_schema may not carry a top-level allOf, anyOf or oneOf.",
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "met" } }, "required": ["status"] },
+          "then": {
+            "properties": {
+              "observed": { "minItems": 1 },
+              "falsifier": { "properties": { "verdict": { "enum": ["pass", "not_present", "error"] } } },
+              "clauses": { "items": { "properties": { "status": { "const": "met" } } } }
+            }
+          },
+          "else": { "required": ["reason"] }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": { "const": "met" },
+              "falsifier": { "properties": { "verdict": { "const": "error" } }, "required": ["verdict"] }
+            },
+            "required": ["status", "falsifier"]
+          },
+          "then": {
+            "properties": { "differs_from_baseline": { "const": true } },
+            "required": ["differs_from_baseline"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reachability": {
+                "anyOf": [
+                  { "properties": { "unreachable": { "minItems": 1 } }, "required": ["unreachable"] },
+                  { "properties": { "broken_click_paths": { "minItems": 1 } }, "required": ["broken_click_paths"] }
+                ]
+              }
+            },
+            "required": ["reachability"]
+          },
+          "then": { "properties": { "status": { "const": "not_met" } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": { "const": "met" },
+              "register_rows": {
+                "contains": {
+                  "required": ["claim", "status"],
+                  "anyOf": [
+                    {
+                      "properties": { "claim": { "const": "unclaimed" } },
+                      "not": {
+                        "required": ["ruling_ref"],
+                        "properties": { "status": { "enum": ["deferred", "waived"] } }
+                      }
+                    },
+                    {
+                      "properties": { "claim": { "const": "this-plan" } },
+                      "not": {
+                        "anyOf": [
+                          { "required": ["wired"], "properties": { "status": { "const": "met" }, "wired": { "const": true } } },
+                          { "required": ["ruling_ref"], "properties": { "status": { "enum": ["deferred", "waived"] } } }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            "required": ["status", "register_rows"]
+          },
+          "then": { "properties": { "status": { "const": "not_met" } } }
+        }
+      ]
+    }
+  }
+}

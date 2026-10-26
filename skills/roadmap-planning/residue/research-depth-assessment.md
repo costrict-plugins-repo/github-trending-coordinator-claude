@@ -1,0 +1,15 @@
+## Step 1.5.0 — Research-depth assessment (EM judgment, PM-authorized)
+
+Before Step 1.5.1's default solo scouts, assess whether the roadmap's ambition exceeds them.
+**If ANY hit, recommend deep research to the PM:**
+
+- Framing uses "best in class", "state of the art", "cutting edge", "novel", or names a frontier
+  reference system to match.
+- ≥3 KEEP clusters touch the same novel domain.
+- A cluster's topic is research-active (half-life of best practice <12 months).
+- PM-stated ambition exceeds what current `docs/wiki/` + peer-repo wikis cover.
+
+The EM sizes research by value class (corpus is the roadmap case) and fires `/research`: (a) replace
+solo scouts, (b) deep-research a subset, or (c) decline. Output lands under
+`state/roadmap/<run-id>/research-corpus/deep-research/<topic-slug>/`; OVERVIEW citations point at
+it, and the Phase 1.5 exit check accepts either shape. Declined or not triggered → Step 1.5.1.

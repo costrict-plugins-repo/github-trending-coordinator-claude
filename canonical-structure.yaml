@@ -1,0 +1,287 @@
+
+
+entries:
+
+  
+  - path: state/cross-repo/inbox/
+    creation: eager
+    schema: cross-repo-memo
+    readme: |
+      This directory is **this repo's active inbox** for cross-repo memos: messages
+      addressed **to** this repo's EM by another repo's EM. Memos arrive **committed**
+      onto this repo's active work branch — durable across devices and sessions,
+      visible in `git log` (or after a push, on other clones) — degrading to an
+      uncommitted/dirty file only as a fallback if the delivery commit itself fails.
+
+      
+      A memo arrives with `status: open`. Read it, act, set `status: actioned` (add a
+      `decision:` if relevant), and commit it into this repo. Closed memos are swept to
+      `state/cross-repo/archive/` — the whole channel lives under `state/cross-repo/`.
+
+      ## Sending — deliver to the RECIPIENT's box, **never your own**
+
+      To send a memo, do **not** hand-write a file in this directory. This is *your*
+      inbox; anything you drop here sits where the recipient never looks. Use the CLI:
+
+      ```
+      bin/cross-repo-memo draft <slug> --to <recipient-em> --title "<one line>"
+      
+      bin/cross-repo-memo send <slug>
+      ```
+
+      It writes the memo into the **recipient's** `state/cross-repo/inbox/` (their inbox),
+      commits it there on their active work branch (falling back to leaving it dirty
+      only if that commit fails), and prints the `Receiver-side:` path. The
+      recipient sees it in *their* `git log` (or `git status`, on the fallback path).
+
+      ## Why writing into another repo's inbox is allowed
+
+      General doctrine says: don't make changes in another repo. **Delivering a memo into
+      a recipient's `state/cross-repo/inbox/` is the canonical exception** — it's a message, not
+      a change to what runs (delivery-intent), and it is the one primitive that makes
+      cross-repo coordination work at all. Send freely; the recipient owns what they do
+      with it.
+
+      ---
+      Schema: `state/cross-repo/inbox/[0-9]*.md` is validated by claude-klabauter's
+      `coordinator_core/write_guards/` engine at write time.
+      Full doctrine: `coordinator-content-repo coordinator/docs/wiki/cross-repo-communication.md`.
+      For the full send-verb reference (draft → compose → send), see `bin/cross-repo-memo.md`.
+
+  
+  - path: state/cross-repo/archive/
+    creation: lazy
+    schema: null
+    readme: |
+      Closed actioned memos live here. There is NO sent/ — outbound memos live in the
+      recipient's inbox (`state/cross-repo/inbox/`), not here.
+
+  # bin/cross-repo-memo.md is a discoverability breadcrumb: the send verb is DoE-owned
+  # and on PATH (not vendored), so a consumer EM's tree-scoped `ls bin/` search finds
+  # nothing without this pointer. Scaffolded from a static template (no substitution).
+  # Spec: cross-repo/inbox/2026-07-06-cross-repo-memo-send-discoverability.md
+  
+  
+  - path: bin/cross-repo-memo.md
+    creation: eager
+    schema: null
+    readme: null
+    template: templates/cross-repo-memo-breadcrumb.md
+
+  
+  - path: CLAUDE.md
+    creation: eager
+    schema: null
+    readme: null
+    produced_by: /coordinator:repo-setup rendering and scaffolding (CLAUDE.md from templates/CLAUDE.md.template)
+
+  
+  - path: docs/README.md
+    creation: eager
+    schema: null
+    readme: null
+    produced_by: /coordinator:repo-setup rendering and scaffolding (docs/README.md from templates/README.md.template)
+
+  
+  - path: docs/exec-summary.md
+    creation: eager
+    schema: null
+    readme: null
+    produced_by: /coordinator:repo-setup rendering and scaffolding (repo-setup-args-and-register resolve-exec-summary-generator)
+
+  
+  - path: .gitignore
+    creation: eager
+    schema: null
+    readme: null
+    produced_by: /coordinator:repo-setup .gitignore step (canonical block from templates/gitignore.project.template)
+
+  
+  - path: .project-rag-ignore
+    creation: eager
+    schema: null
+    readme: null
+    template: templates/dotprojectragignore.tmpl
+
+  
+  - path: .github/pull_request_template.md
+    creation: eager
+    schema: null
+    readme: null
+    template: templates/github-pull-request-template.md
+
+  
+  - path: .git/hooks/post-commit
+    creation: eager
+    schema: null
+    readme: null
+    produced_by: /coordinator:repo-setup post-commit auto-push hook step (coordinator-ensure-hooks-fleet)
+
+  
+  - path: state/handoffs/
+    creation: eager
+    schema: handoff
+    readme: |
+      Session-continuity artifacts written by the `handoff` skill (`coordinator/skills/handoff/SKILL.md`)
+      when a session ends via `/handoff`. Each entry is a per-session handoff record consumed by
+      the next session picking up the same workstream. Empty until the first session ends.
+
+  
+  - path: state/review-trail/
+    creation: eager
+    schema: review
+    readme: |
+      Review records written by `/workstream-complete` and the `handoff` skill
+      (`coordinator/skills/handoff/SKILL.md`) whenever a review pass completes. Each entry is a
+      per-review record forming the audit trail consumed by later review/distill passes. Empty
+      until the first review completes.
+
+  
+  # long-lived context window. Twin of the EPHEMERAL, git-ignored scratch/subagent-sandbox/
+  
+  
+  # THIS-REPO-ONLY: fresh consumer repos scaffolding from this manifest get only
+  
+  
+  - path: state/subagent-share/
+    creation: eager
+    schema: null
+    gitkeep: true
+    readme: null
+
+  
+  - path: state/week-changelog/
+    creation: eager
+    schema: null
+    gitkeep: true
+    readme: null
+
+  
+  - path: state/memos/
+    creation: eager
+    schema: null
+    gitkeep: true
+    readme: null
+
+  
+  - path: state/cross-repo-declarations/
+    creation: eager
+    schema: null
+    gitkeep: true
+    readme: null
+
+  
+  - path: state/cross-repo-outbound/
+    creation: eager
+    schema: null
+    gitkeep: true
+    readme: null
+
+  
+  - path: state/reviews/
+    creation: eager
+    schema: null
+    gitkeep: true
+    readme: null
+
+  
+  - path: state/review-findings/
+    creation: eager
+    schema: null
+    gitkeep: true
+    readme: null
+
+  
+  - path: state/roadmap/
+    creation: eager
+    schema: null
+    gitkeep: true
+    readme: null
+
+  
+  - path: state/audits/
+    creation: eager
+    schema: null
+    gitkeep: true
+    readme: null
+
+  
+  - path: state/recovery/
+    creation: eager
+    schema: null
+    gitkeep: true
+    readme: null
+
+  
+  - path: state/scratch/deep-architecture-survey/
+    creation: eager
+    schema: null
+    gitkeep: true
+    readme: null
+
+  
+  - path: state/scratch/bug-blitz/
+    creation: eager
+    schema: null
+    gitkeep: true
+    readme: null
+
+  
+  - path: state/scratch/artifact-distillation/
+    creation: eager
+    schema: null
+    gitkeep: true
+    readme: null
+
+  
+  - path: tasks/
+    creation: eager
+    schema: null
+    gitkeep: true
+    readme: null
+
+  
+  - path: archive/completed/
+    creation: lazy
+    schema: completion-entry
+    readme: null
+
+  
+  - path: docs/wiki/
+    creation: eager
+    schema: null
+    readme: |
+      Wiki guides written by the `/distill` command (`coordinator/commands/distill.md`) once
+      artifacts accumulate — `/distill` synthesizes plans, lessons, and decisions into durable
+      reference guides here. Empty until the first `/distill` pass runs.
+
+  
+  - path: docs/plans/
+    creation: eager
+    schema: plan
+    readme: |
+      Plan documents written by the `plan` skill (`coordinator/skills/plan/SKILL.md`) once a
+      plan is ratified in plan mode. Each entry is a per-workstream plan consumed by
+      `/execute-plan` dispatch. Empty until the first plan is ratified.
+
+  
+  - path: docs/research/
+    creation: eager
+    schema: null
+    readme: |
+      Research outputs written by the `/research` command (`coordinator/commands/research.md`)
+      once a research pipeline run completes. Each entry is a per-run synthesis (plus an
+      `archive/` for completed run workdirs) consumed by planning and prior-art checks. Empty
+      until the first research run completes.
+
+  
+  - path: state/health/
+    creation: lazy
+    schema: health-status
+    readme: null
+
+  
+  - path: state/lessons.md
+    creation: lazy
+    schema: lesson-entry
+    readme: null

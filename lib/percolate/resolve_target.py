@@ -1,0 +1,769 @@
+"""coordinator/lib/percolate/resolve_target.py — publish-target row resolver.
+
+Native-Python port of `setup/lib/resolve-publish-target.sh`. Normalizes a single pipe-delimited
+publish-target row to the absolute `name|mode|ABSsource|ABSdest[|native_slugs
+[|allowlist]]` form the publish.sh main loop (and, downstream, claude-klabauter's
+percolate preflight) consumes — so callers can import this resolver directly
+instead of shelling out to bash.
+
+Row shapes accepted (field 3, 0-indexed 2, decides the shape):
+  Legacy          (field 3 does NOT start with `repo:` or `publish-mirror:`):
+    name|mode|ABSsource|ABSdest[|native_slugs]                  — 4 or 5 fields, pass-through
+  Portable repo:  (field 3 starts with `repo:`, backward-compat):
+    name|mode|repo:<dest_key>|source_subdir|dest_subdir[|native_slugs]        — 5 or 6 fields
+    DEST resolved via: machine-local get repos.<dest_key>
+  Publish-mirror: (field 3 starts with `publish-mirror:`, primary mirror form):
+    name|mode|publish-mirror:<key>|source_subdir|dest_subdir[|native_slugs[|allowlist]] — 5-7 fields
+    DEST resolved EXCLUSIVELY via: machine-local get publish.mirrors.<key>.path
+    NO repos.* read in this branch — structural class separation (D1/D2).
+
+Return contract (mirrors the bash function's return codes 1:1 — see
+`ResolveError.code`):
+  0 (no exception) — success; the return value is the resolved stdout row.
+  1 — machine-local CLI present but registry key unset (fail-loud, remediation
+      in `ResolveError.message`).
+  2 — malformed row (fail-loud, `ResolveError.message` set).
+  3 — machine-local CLI absent (fall-through signal; `ResolveError.message`
+      is empty, matching the bash no-message rc-3 contract).
+  4 — machine-local CLI resolved and present, but the exec/invocation itself
+      failed (transport error — e.g. Windows WinError 193 from attempting to
+      CreateProcess an extensionless shebang script directly). Distinct from
+      rc 1 on purpose: rc 1 means "the CLI ran fine and reported the key
+      absent"; rc 4 means "the CLI could not be run at all", so the key may
+      already be set correctly — telling the operator to (re)set it would be
+      actively wrong. `ResolveError.message` carries the underlying OSError.
+
+Spec backlink: docs/plans/2026-06-22-portable-registry-resolved-publish-targets.md
+               § C1 (resolve-publish-target lib)
+Port: docs/plans/2026-07-21-percolate-python-port.md (chunk C-W0).
+
+Negative-spec: this module performs no top-level side effects, and no call's
+RESOLVED OUTPUT depends on any other call having run first or on call order —
+every call to `resolve_publish_row` still resolves independently. It does
+memoize raw machine-local registry reads for the remainder of the current
+process (see `_dump_cache`): a performance-only cache, keyed by the resolved
+`machine_local_bin` path, that never changes what any call resolves to and is
+never persisted to disk or shared across process invocations.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional
+from coordinator_core.git.run import run_git
+from coordinator_core.win_portability import is_executable
+
+
+#: `ResolveError.code` for a row that resolved cleanly to a destination no
+#: publish may write into. Aborts every tier; see `_refuse_engine_root_as_dest`.
+UNSAFE_DEST = 5
+
+
+class ResolveError(Exception):
+    """Raised by `resolve_publish_row` / `resolve_machine_local_bin` for a
+    non-zero bash return code. `code` mirrors the bash exit code exactly
+    (1/2/3); `message` is the diagnostic text the bash equivalent would have
+    printed to stderr (empty string for rc 3, which is a silent fall-through
+    signal in the bash original).
+
+    Codes past the bash original's three have no bash twin and are named
+    here: 4 is TRANSPORT (the machine-local CLI exists but could not be run),
+    5 is UNSAFE DEST (the row resolved cleanly to a destination that must
+    never be published into -- see `_refuse_engine_root_as_dest`). Both abort
+    the whole resolution like rc 2; they are separate codes because the
+    operator-facing framing differs and "malformed row" is false for each.
+    """
+
+    def __init__(self, message: str, code: int):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+def _default_meta_root() -> Path:
+    """META_ROOT = the meta-repo root. `COORDINATOR_META_ROOT` env wins when
+    set; otherwise derived from this file's own location. This module lives
+    at coordinator/lib/percolate/resolve_target.py — one directory deeper
+    than the bash original (setup/lib/resolve-publish-target.sh) — so the
+    walk-up depth differs (parents[3] here vs. 3 `dirname` calls there) but
+    both land on the same repo root."""
+    env = os.environ.get("COORDINATOR_META_ROOT")
+    if env:
+        return Path(env)
+    return Path(__file__).resolve().parents[3]
+
+
+def _settings_home_dir() -> Path:
+    """Resolve the coordinator settings home.
+
+    Mirrors ``coordinator_core._settings_home.settings_home()``'s precedence
+    (``COORDINATOR_SETTINGS_HOME`` when set, else ``.coordinator-claude-settings``
+    under ``CLAUDE_HOME`` or the home directory)
+    rather than importing it: this module is deliberately self-contained, since
+    claude-klabauter-root resolution itself routes through the machine-local CLI this
+    function helps locate.
+
+    ``Path.home()`` is used for the home fallback because it honours
+    ``USERPROFILE`` on Windows, where ``HOME`` is typically unset in native
+    shells (PowerShell, cmd.exe). A bare ``os.environ["HOME"]`` would resolve
+    empty there and silently produce a relative path.
+    """
+    override = os.environ.get("COORDINATOR_SETTINGS_HOME")
+    if override:
+        return Path(override)
+    claude_home = os.environ.get("CLAUDE_HOME")
+    base = Path(claude_home) if claude_home else Path.home()
+    return base / ".coordinator-claude-settings"
+
+
+def resolve_machine_local_bin(root: Path) -> Optional[str]:
+    """Locate the machine-local registry CLI. Rung order: `MACHINE_LOCAL_BIN`
+    env var (SECURITY-validated) -> `<root>/bin/machine-local` -> `<root>/
+    coordinator/bin/machine-local` -> `<settings-home>/bin/machine-local` ->
+    `machine-local` on PATH.
+
+    The settings-home rung exists because the `<root>`-relative rungs resolve
+    only for callers whose root is a repo that vendors the CLI. `publish.py`
+    passes the DoE clone, which vendors nothing under `coordinator/bin`, so
+    every filesystem rung missed and resolution fell through to PATH — where
+    the settings-home bin dir is not present on all platforms. That returned
+    None, which the caller rendered as "registry key unset", pointing the
+    operator at a key that was already set correctly and making percolation
+    unusable.
+
+    It is deliberately placed AFTER the `<root>`-relative rungs, not before:
+    an explicit caller-supplied `root` is a stronger signal of intent than the
+    ambient machine install, and tests that hand this function a sandboxed
+    fake root must keep winning over the real machine's settings home. Putting
+    it first leaked this machine's actual registry into those tests.
+
+    Windows note: `machine-local` is delivered as an extensionless Python
+    shebang script alongside a `machine-local.cmd` sibling
+    (`coordinator/bin/gen-launcher-shim.py`'s generated launcher).
+    `CreateProcess` cannot exec the extensionless file directly — it fails
+    with `WinError 193 ("%1 is not a valid Win32 application")` — so on
+    Windows each filesystem rung tries the `.cmd` sibling FIRST, matching the
+    precedent in `coordinator/bin/lib/machine_local_resolve.py`
+    (`windows_cmd_first_candidates`). `shutil.which` is PATHEXT-aware and
+    already finds a `.cmd` on PATH correctly, so the PATH rung needs no
+    change.
+
+    Returns the resolved path string, or None if no rung resolved (bash rc 1).
+    Raises ResolveError(code=2) if MACHINE_LOCAL_BIN fails SECURITY validation
+    (not absolute, or contains '..' traversal) — bash rc 2, propagated fatal,
+    never falls through to the filesystem rungs.
+    """
+    env_bin = os.environ.get("MACHINE_LOCAL_BIN")
+    if env_bin:
+        if not os.path.isabs(env_bin):
+            raise ResolveError(
+                f"resolve_machine_local_bin: SECURITY: MACHINE_LOCAL_BIN='{env_bin}' "
+                "must be an absolute path — refusing to use it.",
+                2,
+            )
+        normalized = env_bin.replace("\\", "/")
+        if "/../" in normalized or normalized.endswith("/.."):
+            raise ResolveError(
+                f"resolve_machine_local_bin: SECURITY: MACHINE_LOCAL_BIN='{env_bin}' "
+                "contains '..' traversal — refusing to use it.",
+                2,
+            )
+        return env_bin
+
+    rung2 = root / "bin" / "machine-local"
+    rung3 = root / "coordinator" / "bin" / "machine-local"
+    # The settings home is the canonical, machine-agnostic install location for
+    # the CLI, so it is a rung in its own right rather than something only a
+    # PATH lookup happens to find. Without it, resolution depends on which repo
+    # `root` points at: when a caller passes the DoE clone (publish.py does),
+    # neither <root>/bin nor <root>/coordinator/bin exists — coordinator-content-repo tracks
+    # no files under coordinator/bin — so every filesystem rung missed and
+    # resolution fell through to PATH. The settings-home bin dir is NOT on PATH
+    # on all platforms, so that fall-through returned None, which the caller
+    # rendered as "registry key unset" and pointed the operator at a key that
+    # was already set correctly. Percolation was unusable as a result.
+    rung_settings_home = _settings_home_dir() / "bin" / "machine-local"
+
+    if os.name == "nt":
+        for rung in (rung2, rung3, rung_settings_home):
+            cmd_sibling = rung.with_suffix(".cmd")
+            if cmd_sibling.is_file():
+                return str(cmd_sibling)
+            if rung.is_file():
+                return str(rung)
+        found = shutil.which("machine-local")
+        if found:
+            return found
+        return None
+
+    if is_executable(rung2):
+        return str(rung2)
+
+    if is_executable(rung3):
+        return str(rung3)
+
+    if is_executable(rung_settings_home):
+        return str(rung_settings_home)
+
+    found = shutil.which("machine-local")
+    if found:
+        return found
+
+    return None
+
+
+# Process-lifetime memo of `machine-local dump`'s output, keyed by the
+# resolved `machine_local_bin` path. `load_targets` (coordinator/lib/percolate/
+# targets.py) resolves every registered publish-target row in a loop, and each
+# row can call `_machine_local_get` several times (dest, primary source, each
+# source_map root) — before this cache, a 9-row registry cost 9-30 separate
+# `machine-local get` subprocess spawns, ~1.4s of process-creation overhead
+# EACH on Windows, to answer what one `machine-local dump` resolves in a
+# single process. Keyed by the binary path (not by meta_root) so two distinct
+# registries reached via two distinct `machine_local_bin` values in the same
+# process — as `test_real_publish_targets_portable_source_map_rows` exercises
+# — never share a cache entry. Never persisted to disk or shared across
+# process invocations: a stale publish-target mapping is worse than a slow
+# one, and this cache exists purely to answer many rows within one already-
+# running process, not to skip re-reading the registry on the next process.
+_dump_cache: dict[str, dict[str, str]] = {}
+
+#: Wall-clock bound on the one `machine-local dump` spawn: 2.0s cost term (an
+#: interpreter start plus a small registry read) + 10.0s scheduling headroom.
+#: Must equal `percolate-round.py :: _REGISTRY_CLI_TIMEOUT_SECS`, which this
+#: self-contained library cannot import (pinned by
+#: `test_percolate_round.py :: test_resolve_target_dump_bound_matches_round_family`).
+_REGISTRY_CLI_TIMEOUT_SECS = 2.0 + 10.0
+
+
+def _dump_registry(machine_local_bin: str) -> dict[str, str]:
+    """Resolve EVERY key `machine-local` knows about, in one process, and
+    memoize the result in `_dump_cache` for the remainder of this process's
+    lifetime. Backed by `machine-local dump` — the same resolution kernel
+    `machine-local get` uses (`resolve_one`, shared by both CLI verbs) — so a
+    value read from here is byte-identical to what a per-key `get` call would
+    have returned for that key.
+
+    Raises ResolveError(code=4) if the CLI could not be EXECUTED at all
+    (`OSError` — e.g. Windows WinError 193 from CreateProcess-ing an
+    extensionless shebang script) — the same TRANSPORT failure class
+    `_machine_local_get` used to raise per key, now raised once for the
+    shared dump instead. This is deliberately distinct from "key unset":
+    conflating the two used to report a correctly-set registry key as unset,
+    pointing the operator at remediation for a key that was never the
+    problem. See module docstring rc-4 for the full contract.
+
+    A non-zero exit or unparseable stdout — the `dump` analogue of the
+    version-guard/malformed-TOML operational failure that would have made
+    EVERY per-key `get` call fail identically — degrades to an empty
+    registry rather than raising: every subsequent key lookup then reports
+    "not found", the same net result the old per-key loop would have
+    produced for every one of those calls individually."""
+    if machine_local_bin in _dump_cache:
+        return _dump_cache[machine_local_bin]
+
+    try:
+        result = subprocess.run(
+            [machine_local_bin, "dump"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_REGISTRY_CLI_TIMEOUT_SECS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ResolveError(
+            f"resolve-publish-target: machine-local invocation failed — "
+            f"'{machine_local_bin} dump' did not finish within "
+            f"{_REGISTRY_CLI_TIMEOUT_SECS}s. This is a TRANSPORT failure (the "
+            "CLI hung), NOT an unset registry key — the keys it would have "
+            "read may already be set correctly. The engine may still be "
+            "running it; rerun `machine-local dump` by hand to check.",
+            4,
+        ) from exc
+    except OSError as exc:
+        raise ResolveError(
+            f"resolve-publish-target: machine-local invocation failed — "
+            f"could not execute '{machine_local_bin} dump': {exc}. "
+            "This is a TRANSPORT failure (the CLI itself could not be run), "
+            "NOT an unset registry key — the keys it would have read may "
+            "already be set correctly. On Windows this is typically "
+            "WinError 193 from attempting to exec an extensionless shebang "
+            "script directly; verify the resolved machine-local path is a "
+            "`.cmd`/`.exe` sibling, not the bare shebang file.",
+            4,
+        ) from exc
+
+    values: dict[str, str] = {}
+    if result.stdout:
+        try:
+            parsed = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            values = {k: v for k, v in parsed.items() if isinstance(v, str)}
+
+    _dump_cache[machine_local_bin] = values
+    return values
+
+
+def _env_override_key(key: str) -> str:
+    """Mirror `_machine_local.py`'s own `_env_key`: the `MACHINE_LOCAL_<KEY>`
+    escape-hatch name for a dotted registry key. Forward-only and exact —
+    `key` is always a literal dotted string the caller already knows, so
+    there is no reverse-mapping ambiguity here (unlike guessing a dotted key
+    back out of an arbitrary `MACHINE_LOCAL_*` env var name, which is lossy
+    for a key segment that itself contains an underscore, e.g.
+    `coordinator_claude`)."""
+    return "MACHINE_LOCAL_" + key.upper().replace(".", "_")
+
+
+def _machine_local_get(machine_local_bin: str, key: str) -> Optional[str]:
+    """Resolve `key` from `<machine_local_bin> dump`'s memoized output (see
+    `_dump_registry`) rather than spawning a dedicated `<machine_local_bin>
+    get <key>` process per call — the per-row loop in `load_targets` used to
+    cost one subprocess per key; this costs one subprocess per DISTINCT
+    `machine_local_bin` for the whole process's lifetime. Returns the
+    resolved value on success, None if the key is absent (or resolved to
+    empty string — `dump`'s JSON omits a cleanly-absent key, but a key
+    explicitly declared empty in the registry — e.g. a `repos.x = ""`
+    sentinel — round-trips as `""`, which is normalized to None here exactly
+    as the old per-key path did: an empty base would otherwise be silently
+    concatenated with the sigil's subpath, producing a bare "\\coordinator"
+    that fails much later as "source path does not exist", far from the
+    missing key that caused it).
+
+    BV-20260927-05: `dump`'s registry enumeration is TOML-layer-only, so a
+    key with no TOML declaration at all is never a candidate `dump` even
+    tries to resolve — `get`/`has` still answer it via their own last-resort
+    `MACHINE_LOCAL_<KEY>` env check (the `resolve_one` kernel), but a value
+    read only from `_dump_registry`'s memoized dict never sees that rung.
+    Re-applying the same last-resort env check here, once, keeps this
+    single-process batched reader at parity with a per-key `get` call for
+    the one rung `dump`'s enumeration structurally cannot reach — zero
+    additional subprocess spawns, since `os.environ` is already in-process."""
+    val = _dump_registry(machine_local_bin).get(key) or None
+    if val is not None:
+        return val
+    return os.environ.get(_env_override_key(key)) or None
+
+
+def _resolve_machine_local_or_raise(meta_root: Path) -> str:
+    """Resolve the machine-local CLI.
+
+    Two distinct failures, deliberately NOT collapsed:
+
+    - Nothing resolves to a usable executable -> ResolveError(code=3) with an
+      empty message, matching the bash no-message fall-through. This covers a
+      genuinely absent path AND a broken symlink (a directory entry that
+      exists while its target does not) — both fail `os.path.exists` the same
+      way and land here.
+    - The path EXISTS but is not executable -> ResolveError(code=4), the same
+      TRANSPORT class `_machine_local_get` raises when exec itself fails.
+
+    Reporting the second as code 3 is the "unreachable reads as unset" pathology
+    that rc-4 exists to eliminate: a present-but-unrunnable CLI is a transport
+    problem, and answering it with the unset-key framing sends the operator to
+    re-set a key that was never wrong. On Windows the exec-bit check is
+    meaningless (`os.access(..., X_OK)` is true for any existing file), so that
+    platform reaches this failure later, inside `_machine_local_get`; on POSIX it
+    is caught here. Same class, same code, whichever leg observes it.
+    """
+    machine_local_bin = resolve_machine_local_bin(meta_root)
+    if machine_local_bin is None:
+        machine_local_bin = str(meta_root / "bin" / "machine-local")
+    if not is_executable(machine_local_bin):
+        if os.path.exists(machine_local_bin):
+            raise ResolveError(
+                f"resolve-publish-target: machine-local at '{machine_local_bin}' "
+                "exists but is not executable. This is a TRANSPORT failure (the "
+                "CLI itself could not be run), NOT an unset registry key — the "
+                "keys it would have read may already be set correctly. Restore "
+                "the exec bit, or re-run /coordinator:setup (Phase 3).",
+                4,
+            )
+        raise ResolveError("", 3)
+    return machine_local_bin
+
+
+def resolve_publish_row(raw_row: str, meta_root: Optional[Path] = None) -> str:
+    """Normalize a single pipe-delimited publish-target row to the absolute
+    `name|mode|ABSsource|ABSdest[|native_slugs[|allowlist]]` form.
+
+    `meta_root` defaults to `_default_meta_root()` (COORDINATOR_META_ROOT env
+    or this file's own repo-root-relative location); pass explicitly to pin
+    it (mirrors the bash function reading `COORDINATOR_META_ROOT`/`BASH_SOURCE`
+    fresh on every call).
+
+    Raises ResolveError with `.code` in {1, 2, 3} on any of the bash
+    function's non-zero-exit paths — see the module docstring's return
+    contract.
+    """
+    # NOTE: Python's str.split("|") preserves trailing empty fields (unlike
+    # bash's `IFS='|' read -ra`, which drops them) — the manual field-peel the
+    # bash original performs is therefore unnecessary here; a plain split
+    # already keeps a trailing empty dest_subdir intact.
+    fields = raw_row.split("|")
+    nfields = len(fields)
+    field3 = fields[2] if nfields > 2 else ""
+
+    if field3.startswith("publish-mirror:"):
+        return _resolve_publish_mirror_row(raw_row, fields, nfields, field3, meta_root)
+
+    if not field3.startswith("repo:"):
+        # LEGACY ABSOLUTE PATH — pass through verbatim.
+        if nfields < 4 or nfields > 5:
+            raise ResolveError(
+                f"resolve-publish-target: malformed legacy row (expected 4 or 5 fields, "
+                f"got {nfields}): {raw_row}",
+                2,
+            )
+        return raw_row
+
+    return _resolve_repo_row(raw_row, fields, nfields, field3, meta_root)
+
+
+def _resolve_repo_row(
+    raw_row: str,
+    fields: list[str],
+    nfields: int,
+    field3: str,
+    meta_root: Optional[Path],
+) -> str:
+    """PORTABLE ROW (`repo:`) — retained for backward-compat. Resolves DEST
+    via `repos.<dest_key>`.
+
+    Deliberately NOT extended with allowlist/source_map support: this branch
+    keeps its original 5-6 field guard and has never carried an allowlist.
+    Only `_resolve_publish_mirror_row` (the `publish-mirror:` branch) gained
+    `source_map` (§2 of the multi-source config surface) — do not "fix" that
+    asymmetry by extending this function to match; it is scoped intentionally."""
+    if nfields < 5 or nfields > 6:
+        raise ResolveError(
+            f"resolve-publish-target: malformed portable row (expected 5 or 6 fields, "
+            f"got {nfields}): {raw_row}",
+            2,
+        )
+
+    name = fields[0]
+    mode = fields[1]
+    source_subdir = fields[3]
+    dest_subdir = fields[4]
+    native_slugs = fields[5] if nfields == 6 else ""
+
+    dest_key = field3[len("repo:") :]
+    if not dest_key:
+        raise ResolveError(
+            f"resolve-publish-target: malformed portable row — empty repo key in field 3 "
+            f"('repo:' alone): {raw_row}",
+            2,
+        )
+    if not source_subdir:
+        raise ResolveError(
+            f"resolve-publish-target: malformed portable row — empty source_subdir "
+            f"(field 4): {raw_row}",
+            2,
+        )
+
+    root = meta_root if meta_root is not None else _default_meta_root()
+    abs_source = str(root / source_subdir)
+
+    machine_local_bin = _resolve_machine_local_or_raise(root)
+
+    dest_root = _machine_local_get(machine_local_bin, f"repos.{dest_key}")
+    if dest_root is None:
+        raise ResolveError(
+            f"resolve-publish-target: repos.{dest_key} is unset on this machine (must "
+            "NOT be re-added — key was removed by migration to publish.mirrors.*; see "
+            f"remediation below) — cannot resolve dest for target '{name}'.\n"
+            f"  Remediation: machine-local set publish.mirrors.{dest_key}.path "
+            "<absolute-path-to-the-publish-repo>",
+            1,
+        )
+
+    _refuse_engine_root_as_dest(name, f"repos.{dest_key}", dest_root)
+
+    abs_dest = dest_root if not dest_subdir else f"{dest_root}/{dest_subdir}"
+
+    if native_slugs:
+        return f"{name}|{mode}|{abs_source}|{abs_dest}|{native_slugs}"
+    return f"{name}|{mode}|{abs_source}|{abs_dest}"
+
+
+def _resolve_source_sigil(
+    sigil: str, root: Path, machine_local_bin: str, *, strict: bool = False
+) -> str:
+    """Resolve one SOURCE-position sigil to an absolute path. `plugin-source:
+    <key>[/subpath]` reads `plugin.mirrors.<key>.source_path` from the
+    registry; anything else is the legacy meta-root-relative form. Shared by
+    the row's primary field-4 source and by every root named in a
+    `source_map` entry (§2) — the only two SOURCE-position call sites.
+    `machine_local_bin` must already be resolved by the caller; this helper
+    never re-resolves it, so it must be called with the SAME resolved value
+    at every call site within one row.
+
+    `strict` is the deliberate asymmetry between the two call sites, NOT
+    something to "fix" into consistency:
+      - strict=False (default) — the PRIMARY field-4 source. Unresolved
+        `plugin.mirrors.<key>.source_path` falls back to
+        `${meta_root}/plugins/<key>` with a stderr warning, exactly as
+        before. Left untouched on purpose: every existing publish-targets
+        row relies on this call site, and loosening or tightening it would
+        change resolved output for rows that predate `source_map` entirely.
+      - strict=True — a `source_map` (§2) entry only. Unresolved
+        `plugin.mirrors.<key>.source_path` falls back to the ALREADY
+        machine-local `repos.<key>` (underscore-normalized) key before
+        failing; if that too is unset, raises ResolveError(code=1) instead
+        of warning-and-falling-back to a path that may not exist. A
+        source_map root silently resolving to a nonexistent tree is exactly
+        the empty-source-directory mass-delete failure mode this field was
+        introduced to prevent — a warning nobody reads is not a mitigation.
+    """
+    if sigil.startswith("plugin-source:"):
+        ps_ref = sigil[len("plugin-source:") :]
+        if "/" in ps_ref:
+            ps_key, ps_subpath = ps_ref.split("/", 1)
+            ps_subpath = "/" + ps_subpath
+        else:
+            ps_key, ps_subpath = ps_ref, ""
+
+        if ".." in ps_subpath:
+            raise ResolveError(
+                f"resolve-publish-target: rejected unsafe plugin-source subpath in '{sigil}'",
+                2,
+            )
+
+        plugin_mirror_key = f"plugin.mirrors.{ps_key}.source_path"
+        ps_base = _machine_local_get(machine_local_bin, plugin_mirror_key)
+
+        if strict:
+            if ps_base is None:
+                # repos.* keys are underscore-normalized fleet-wide
+                # (repos.content_root, repos.claude_klabauter, …) while
+                # plugin-source sigils use the repo's hyphenated directory
+                # name (plugin-source:claude-klabauter) — normalize before
+                # the lookup, not the sigil itself.
+                repos_key = f"repos.{ps_key.replace('-', '_')}"
+                ps_base = _machine_local_get(machine_local_bin, repos_key)
+                if ps_base is None:
+                    raise ResolveError(
+                        f"resolve-publish-target: unresolvable source_map sigil "
+                        f"'{sigil}' — neither {plugin_mirror_key} nor {repos_key} "
+                        "is set on this machine.\n"
+                        f"  Remediation: machine-local set {repos_key} "
+                        "<absolute-path-to-the-repo>\n"
+                        f"  (or, to pin a mirror distinct from repos.*: machine-local "
+                        f"set {plugin_mirror_key} <absolute-path>)",
+                        1,
+                    )
+            return f"{ps_base}{ps_subpath}"
+
+        if ps_base is None:
+            ps_base = str(root / "plugins" / ps_key)
+            print(
+                f"resolve-publish-target: {plugin_mirror_key} unset — "
+                f"falling back to {ps_base}",
+                file=sys.stderr,
+            )
+            print(
+                f"  Remediation: machine-local set {plugin_mirror_key} "
+                "<absolute-path-to-doe-coordinator>",
+                file=sys.stderr,
+            )
+        return f"{ps_base}{ps_subpath}"
+
+    return str(root / sigil)
+
+
+def _checked_out_branch(repo_root: str) -> Optional[str]:
+    """Branch name `repo_root`'s HEAD points at, read off disk with no git spawn.
+
+    None on a detached HEAD or an unreadable repo -- the caller treats None as
+    "cannot prove it is safe".
+    """
+    from coordinator_core.git.repo_root import git_dir
+
+    resolved = git_dir(repo_root)
+    try:
+        head = (Path(resolved) / "HEAD").read_text(encoding="utf-8").strip() if resolved else ""
+    except OSError:
+        return None
+    prefix = "ref: refs/heads/"
+    return head[len(prefix) :] if head.startswith(prefix) else None
+
+
+def _refuse_engine_root_as_dest(
+    name: str, key: str, dest_root: str, track_ref: Optional[str] = None
+) -> None:
+    """Refuse a publish dest that IS this box's deployed engine mirror, unless
+    that clone is checked out on the mirror's own non-default `track_ref` branch.
+
+    An engine root is a BUILD ARTIFACT that the fleet executes; a publish
+    mirror is a WORKTREE a round writes a projection into and pushes. They are
+    the same repository on two different clones, which is exactly why the
+    registry can be pointed at the wrong one and nothing downstream notices:
+    `/root/klabauter` is a real clone of `claude-klabauter`, checked out on
+    `main`, with a live push remote. A publish resolving there commits and
+    pushes the round straight onto the published mirror's default branch --
+    the branch cloud Setup scripts curl from HEAD -- bypassing the
+    percolate -> candidate -> PR -> main flow entirely, with no error at any
+    layer because every operation succeeds.
+
+    `is_published_engine_mirror` is the existing single predicate for "am I
+    about to treat a build artifact as a working tree" and is reused rather
+    than re-derived (it is fail-open on an unreadable registry, so a registry
+    hiccup cannot invent this refusal). Code 2 -- shared-data corruption, the
+    arm that aborts the WHOLE resolution -- never code 1: a value that is a
+    live trap must not be skippable by a target filter, and the "unset
+    registry key" framing rc 1 carries would send the operator to set a key
+    that is already set, just set to the wrong thing. `UNSAFE_DEST` rather
+    than rc 2 so the driver does not print "malformed row" over a row whose
+    every field is well-formed.
+
+    The hazard is the default branch, not the clone. A deployed mirror checked
+    out on its registered `publish.mirrors.<key>.track_ref` branch (e.g.
+    `candidate`) IS the flow's staging branch, so a round committing and
+    pushing there is the percolate -> candidate step itself (PM ruling
+    2026-09-19: publish runs atop the git-tracked engine repo, never a second
+    clone). A clone left on another branch is switched onto `track_ref` first; one
+    git will not switch (dirty tree) is refused. `main`/`master` stay refused
+    whatever `track_ref` says.
+    """
+    try:
+        from coordinator_core.engine_root import is_published_engine_mirror
+    except Exception:  # noqa: BLE001 -- a guard that cannot load must not block a publish
+        return
+    try:
+        if not is_published_engine_mirror(dest_root):
+            return
+    except Exception:  # noqa: BLE001 -- same fail-open contract as the predicate itself
+        return
+    if track_ref:
+        # Same normalization as publish.py::_expected_local_branch.
+        track_branch = track_ref[len("origin/") :] if track_ref.startswith("origin/") else track_ref
+        tracks_default_branch = track_branch in ("main", "master")
+        if not tracks_default_branch:
+            if _checked_out_branch(dest_root) == track_branch:
+                return
+            # Off-track is routine (a human or session left the clone on `main`), not a
+            # hazard in itself: the hazard is committing there. Move it onto the track
+            # branch; a switch git refuses (dirty tree, missing branch) falls through
+            # to the refusal below.
+            switched = run_git(["-C", dest_root, "switch", "--quiet", track_branch]).ok
+            if switched and _checked_out_branch(dest_root) == track_branch:
+                print(
+                    f"resolve-publish-target: switched {dest_root} onto its track_ref "
+                    f"branch '{track_branch}'",
+                    file=sys.stderr,
+                )
+                return
+    raise ResolveError(
+        f"resolve-publish-target: {key} resolves to '{dest_root}', which is this "
+        "box's DEPLOYED ENGINE MIRROR (the registered repos.claude_klabauter "
+        f"clone), not a publish worktree -- refusing to resolve dest for target "
+        f"'{name}'. Publishing there would commit and push onto the published "
+        "mirror's own checked-out branch, which is not its non-default track_ref.\n"
+        f"  Remediation: check that clone out on its track_ref branch (e.g. "
+        f"`git -C {dest_root} switch candidate`), or machine-local set {key} "
+        "<absolute-path-to-a-SEPARATE-clone-of-the-publish-repo>",
+        UNSAFE_DEST,
+    )
+
+
+def _resolve_publish_mirror_row(
+    raw_row: str,
+    fields: list[str],
+    nfields: int,
+    field3: str,
+    meta_root: Optional[Path],
+) -> str:
+    """`publish-mirror:<key>` branch — primary mirror form. Resolves DEST
+    EXCLUSIVELY via `publish.mirrors.<key>.path`; no `repos.*` read (D1/D2
+    structural class separation)."""
+    if nfields < 5 or nfields > 8:
+        raise ResolveError(
+            f"resolve-publish-target: malformed publish-mirror row (expected 5–8 "
+            f"fields, got {nfields}): {raw_row}",
+            2,
+        )
+
+    name = fields[0]
+    mode = fields[1]
+    source_subdir = fields[3]
+    dest_subdir = fields[4]
+    native_slugs = fields[5] if nfields >= 6 else ""
+    allowlist = fields[6] if nfields >= 7 else ""
+    source_map = fields[7] if nfields == 8 else ""
+
+    key = field3[len("publish-mirror:") :]
+    if not key:
+        raise ResolveError(
+            "resolve-publish-target: malformed publish-mirror row — empty key in field "
+            f"3 ('publish-mirror:' alone): {raw_row}",
+            2,
+        )
+    if not source_subdir:
+        raise ResolveError(
+            "resolve-publish-target: malformed publish-mirror row — empty source_subdir "
+            f"(field 4): {raw_row}",
+            2,
+        )
+
+    root = meta_root if meta_root is not None else _default_meta_root()
+
+    # Resolved ONCE, before every SOURCE- and DEST-position sigil lookup
+    # below (primary source, each source_map root, and dest) — a prior
+    # version of this function re-resolved it a second time ahead of the
+    # dest lookup even though the primary-source branch already needed it.
+    machine_local_bin = _resolve_machine_local_or_raise(root)
+
+    abs_source = _resolve_source_sigil(source_subdir, root, machine_local_bin)
+
+    dest_root = _machine_local_get(machine_local_bin, f"publish.mirrors.{key}.path")
+    if dest_root is None:
+        raise ResolveError(
+            f"resolve-publish-target: publish.mirrors.{key}.path is unset on this "
+            f"machine — cannot resolve dest for target '{name}'.\n"
+            f"  Remediation: machine-local set publish.mirrors.{key}.path "
+            "<absolute-path-to-the-publish-repo>",
+            1,
+        )
+
+    _refuse_engine_root_as_dest(
+        name,
+        f"publish.mirrors.{key}.path",
+        dest_root,
+        _machine_local_get(machine_local_bin, f"publish.mirrors.{key}.track_ref"),
+    )
+
+    abs_dest = dest_root if not dest_subdir else f"{dest_root}/{dest_subdir}"
+
+    # source_map: `<source-sigil>=<csv-of-entries>` segments joined by `;`.
+    # Each sigil resolves through the SAME helper (and the same
+    # machine_local_bin) as the primary source; the CSV of allowlist-entry
+    # names passes through unresolved — publish.py maps entries -> roots.
+    resolved_source_map = ""
+    if source_map:
+        resolved_segments = []
+        for segment in source_map.split(";"):
+            if not segment:
+                continue
+            sig, sep, csv = segment.partition("=")
+            if not sep or not sig or not csv:
+                raise ResolveError(
+                    f"resolve-publish-target: malformed source_map segment '{segment}' "
+                    f"in row: {raw_row}",
+                    2,
+                )
+            abs_root = _resolve_source_sigil(sig, root, machine_local_bin, strict=True)
+            resolved_segments.append(f"{abs_root}={csv}")
+        resolved_source_map = ";".join(resolved_segments)
+
+    out_fields = [name, mode, abs_source, abs_dest, native_slugs, allowlist, resolved_source_map]
+    while out_fields and out_fields[-1] == "":
+        out_fields.pop()
+    return "|".join(out_fields)
