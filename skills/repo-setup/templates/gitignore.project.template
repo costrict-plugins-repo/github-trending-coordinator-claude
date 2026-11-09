@@ -1,0 +1,36 @@
+# Residue rule: a non-empty `gitignore_candidates` from the close residue output lands here as an
+# ignore rule (CLOSE-RESIDUE-IS-COMMITTED-OR-GITIGNORED); never commit such a path.
+# coordinator — per-machine and per-session state (managed block)
+.coordinator-local/
+.claude/settings.local.json
+scratch/
+scratch-hold/
+state/.repo-setup-just-ran
+state/.workday-start-marker
+/.coordinator-doctrine-edit-approved
+state/orientation_cache.md
+
+# coordinator — ceremony and coverage transients
+state/housekeeping-liveness.json
+state/engine-provenance-counts.jsonl
+
+# coordinator — group-EM watch state
+state/group-em-watch.json
+state/group-em-watch-parked.json
+state/group-em-watch-spool.jsonl
+
+# coordinator — emitted workflow scripts and receipts (generated, ~200 KB each, never committed)
+state/**/fire-*.mjs
+state/**/*.fire.mjs
+state/**/*.mjs.emitted.json
+
+# coordinator — ephemeral artifacts (build intermediates, root-level scratch output)
+Intermediate/
+/scratch_*
+
+# project-rag corpus output (never commit; ~230MB in history)
+.project-rag-corpus-artifacts/
+.project-rag-corpus-store/
+
+# warp leg prompts are working files; the engine prunes them for finished runs
+state/warp/*/prompts/

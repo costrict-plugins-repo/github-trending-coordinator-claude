@@ -1,0 +1,287 @@
+
+
+# set are derived from / validated against this file (VALIDATE-not-GENERATE at
+
+
+# CARGO-CULT GUARD (read before adding resource machinery): the coordinator
+
+
+#                     INVARIANT: triage=true ⟹ weight ∈ {cheap, standard}.
+
+
+# NOT IN THIS MANIFEST — P-7a is EM-native (mcp-registration check via
+
+
+[[probe]]
+id = "P-1"
+cluster = "machine-local"
+weight = "cheap"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["machine-local absent", "substrate not bootstrapped", "setup Phase 3"]
+triage = true
+severity_if_fail = "error"
+remediation = "Run /coordinator:install Phase 3"
+
+[[probe]]
+id = "P-2"
+cluster = "machine-local"
+weight = "standard"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["registry.toml unparseable", "schema mismatch", "tomllib", "TOML broken"]
+triage = false
+severity_if_fail = "error"
+remediation = "Re-run /coordinator:install Phase 3; check for manual edits that broke TOML structure"
+
+[[probe]]
+id = "P-3"
+cluster = "machine-local"
+weight = "standard"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["no repos keys", "registry.local.toml empty", "repos.* unpopulated"]
+triage = false
+severity_if_fail = "degraded"
+remediation = "Run machine-local set repos.<name> <path> for each sibling repo"
+
+[[probe]]
+id = "P-4"
+cluster = "machine-local"
+weight = "standard"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["machine-local CLI not found", "bin not on PATH", "CLI failed", "machine-local key not found"]
+triage = true
+severity_if_fail = "error"
+remediation = "Re-run /coordinator:install Phase 3; on macOS <settings-home>/bin is the primary resolver location (reached via the coordinator/bin forwarder, not PATH directly); the compat forwarder at ~/.claude/bin is also retained during the transition window — re-running Phase 3 installs both"
+
+
+[[probe]]
+id = "P-7"
+cluster = "whoami"
+weight = "standard"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["mcpServers absent", "enabled plugin missing mcp server", "config missing", "mcpServers entry"]
+triage = false
+severity_if_fail = "degraded"
+remediation = "An enabled MCP-serving plugin (project-rag, example-game-repo-control, or notebooklm) has no entry in ~/.claude.json mcpServers — re-run plugin install to register it. An empty mcpServers map is otherwise healthy (coordinator ships no first-party MCP server; core: none, docs/wiki/mcp-topology.md)."
+
+
+[[probe]]
+id = "P-10"
+cluster = "resolver"
+weight = "standard"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["claude-home not found", "resolver drift", "plugins did not resolve", "claude-home"]
+triage = true
+severity_if_fail = "error"
+remediation = "Re-run /coordinator:install Phase 3; on macOS <settings-home>/bin is the primary resolver location reached via the coordinator/bin forwarder (not PATH directly) — re-running Phase 3 installs the forwarder and the claude-home + _claude_home.py scripts at <settings-home>/bin; compat forwarder also retained at ~/.claude/bin during the transition window"
+
+[[probe]]
+id = "P-14"
+cluster = "resolver"
+weight = "cheap"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["bare machine-local not found", "forwarder missing", "bin not on PATH (macos)", "bare-name resolver", "command not found machine-local", "command not found claude-home"]
+
+
+triage = false
+severity_if_fail = "error"
+
+
+remediation = "P-14 failure: either the plugin-bin forwarder is absent (plugin corruption / harness did not inject plugins/*/bin — reinstall the plugin) OR the real <settings-home>/bin/<tool> resolver is missing (re-run /coordinator:install Phase 3); <settings-home> = $(coordinator-settings-home); compat forwarder also retained at ~/.claude/bin during the transition window"
+
+
+[[probe]]
+id = "P-8"
+cluster = "structure"
+weight = "cheap"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["no sentinels", "cold start", "doctor never run", "doctor-last-run absent"]
+triage = false
+severity_if_fail = "degraded"
+remediation = "Run each installed plugin's doctor once to bootstrap the sentinel"
+
+[[probe]]
+id = "P-11"
+cluster = "structure"
+weight = "standard"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["templates drift", "publish.sh customized", "setup sync", "template out of date"]
+triage = false
+severity_if_fail = "degraded"
+remediation = "Run verify-templates-setup-sync.py (no flags, inspect-only) to see drift; recover manually with cp coordinator/templates/setup/<file> ~/.claude/setup/<file>"
+
+[[probe]]
+id = "P-12"
+cluster = "structure"
+weight = "standard"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["canonical structure incomplete", "cross-repo dir missing", "scaffold", "README missing"]
+triage = false
+severity_if_fail = "degraded"
+remediation = "Run python3 -m coordinator_core.install.scaffold_structure --root ~/.claude --manifest-root <coordinator-plugin-root> to restore; or re-run /coordinator:install Phase 3 Step 7"
+
+
+[[probe]]
+id = "P-13"
+cluster = "currency"
+weight = "cheap"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["onboarding drift", "schema version stale", "coordinator-currency", "currency stamp", "unstamped legacy", "onboarding currency"]
+triage = true
+severity_if_fail = "degraded"
+remediation = "Re-run /repo-setup to stamp this repo with the current coordinator schema version"
+
+
+[[probe]]
+id = "P-15"
+cluster = "system-prereq"
+weight = "standard"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["git not found", "python not found", "gh not found", "node not found", "system prerequisites", "prereq", "Step Zero", "install prerequisites", "missing dependency"]
+triage = true
+severity_if_fail = "error"
+remediation = "Install the missing hard prerequisite(s): git (brew install git / apt-get install git), Python 3.11+ (https://python.org/downloads), GitHub CLI (brew install gh / winget install GitHub.cli), Node.js LTS (brew install node / winget install OpenJS.NodeJS.LTS)"
+
+
+[[probe]]
+id = "P-16"
+cluster = "machine-local"
+weight = "cheap"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["hardware absent", "hardware.cores missing", "hardware.ram_gb missing", "hardware capacity", "worker cap", "capacity budget", "hardware SSOT"]
+triage = false
+severity_if_fail = "degraded"
+remediation = "hardware.cores / hardware.ram_gb absent from machine-local. Remediation depends on your install path: (1) coordinator:install users — re-run coordinator:install Phase 3 (the hardware-audit step seeds these values via lib/detect-hardware.py); (2) OSS setup/install.sh users — re-run setup/install.sh (the --setup-only path seeds hardware.* via the same detector). After re-running, verify with: machine-local get hardware.cores"
+
+[[probe]]
+id = "P-17"
+cluster = "machine-local"
+weight = "standard"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["shell", "login-shell", "bash-profile", "local-bin", "path", "orphan", "shell-env"]
+
+
+triage = false
+severity_if_fail = "error"
+remediation = "bash login shell orphaned ~/.local/bin — run coordinator:install or normalize-env.sh"
+
+
+# ---------------------------------------------------------------------------
+# Cluster: ue-overrides — UE override path verifier (OPTIONAL — silent skip if absent)
+# ---------------------------------------------------------------------------
+
+
+[[probe]]
+id = "P-9"
+cluster = "ue-overrides"
+weight = "standard"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["ue override drift", "verify-ue-overrides", "ue plugin override", "enabledPlugins drift"]
+triage = false
+severity_if_fail = "degraded"
+remediation = "Run verify-ue-overrides.py (no flags, inspect-only) and follow the remediation it prints. It names the registry key and the settings.json file itself, which is why this text does not: a private repo codename hardcoded here is rewritten by the publish-time depersonalization, and the published engine would then send you to a key no registry can hold. An unregistered UE repo is reported as not-applicable, not drift."
+
+
+[[probe]]
+id = "P-18"
+cluster = "structure"
+weight = "standard"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["install singularity", "split install", "multiple clones", "doubled venv pin", "claude-home", "marketplace divergence", "symlink install"]
+
+
+triage = true
+severity_if_fail = "error"
+remediation = "Multiple coordinator install trees or divergent registration detected — reconcile to a single ~/.claude install (remove stray clones/symlinks; align settings.json / settings.local.json / known_marketplaces.json; fix a doubled .claude/.claude venv pin by re-running /coordinator:install). Re-run /coordinator:install."
+
+
+[[probe]]
+id = "P-19"
+cluster = "currency"
+weight = "standard"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["release currency", "plugin update available", "coordinator behind", "coordinator-update", "git tag currency", "release tag", "update available"]
+triage = false
+severity_if_fail = "degraded"
+advisory_only = true  # body emits note_advisory only; never drives AMBER. Catalog renders "advisory".
+remediation = "Run `/coordinator-update` to update coordinator"
+
+
+[[probe]]
+id = "P-20"
+cluster = "system-prereq"
+weight = "cheap"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["bash<4", "bash 3.2", "old bash on PATH", "system bash ahead of brew bash", "BASH_VERSINFO", "macos default bash"]
+triage = true
+severity_if_fail = "error"
+remediation = "The bash resolved first on PATH is < 4 (macOS ships 3.2 at /bin/bash). Install a modern bash with your platform's package manager (brew install bash / apt-get install bash / dnf install bash) and ensure its install prefix (e.g. /opt/homebrew/bin, /usr/local/bin, or /usr/bin) precedes /bin on PATH; re-run /coordinator:install to re-verify."
+
+[[probe]]
+id = "P-21"
+cluster = "system-prereq"
+weight = "cheap"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["content-root missing", "settings-home content-root absent", ".coordinator-content-root pointer", "durable coordinator root pointer", "DR-072", "coordinator root unresolvable"]
+triage = true
+severity_if_fail = "error"
+remediation = "No <settings-home>/machine-local/.coordinator-content-root pointer found (DR-072 durable location) and no ~/.claude/.coordinator-content-root fallback either — re-run /coordinator:install to re-seed the durable coordinator-root pointer."
+
+
+# install copy (usually ${CLAUDE_HOME:-$HOME}/.claude/setup/, PERCOLATE_ROOT
+
+
+# live copy. Machine-dependent (needs a live-install PERCOLATE_ROOT to
+
+
+[[probe]]
+id = "P-22"
+cluster = "structure"
+weight = "standard"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["publish-targets.portable drift", "publish-targets divergence", "OSS mirror allowlist drift", "live install publish targets", "wiki seed allowlist re-drift", "percolate root publish targets mismatch"]
+triage = false
+severity_if_fail = "degraded"
+remediation = "Run verify-publish-targets-portable-sync.py (no flags, inspect-only) to see which row(s) diverged and how; recover manually by hand-copying the correct row(s) between the DoE-tracked copy and the live-install copy — this check never syncs either copy itself."
+
+
+[[probe]]
+id = "P-23"
+cluster = "structure"
+weight = "cheap"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["claude-author wrapper drift", "claude-author stale", "wrapper byte copy stale", "claude-author not updated", "launcher fix had no effect"]
+triage = false
+severity_if_fail = "degraded"
+remediation = "Re-publish the wrapper: re-run python scripts/setup.py (installer Step 3.5b, _install_claude_author_wrapper in coordinator_core/install/maximalist.py) to sync ~/.local/bin/claude-author from <claude_klabauter_root>/coordinator/bin/claude-author.py"
+
+[[probe]]
+id = "P-24"
+cluster = "structure"
+weight = "cheap"
+interactivity = "silent"
+fix = "none"
+symptom_keywords = ["stale registered path", "moved repo", "mcp server red", "launchd plist stale path", "claude.json stale project", "repo moved"]
+triage = false
+severity_if_fail = "degraded"
+remediation = "Report only: each finding names the file, key and missing path (plus a likely ~/X relocation). Route the fix to the file's owner (harness for ~/.claude.json, the registering project for plists and .mcp.json, `machine-local set` for the registry)"

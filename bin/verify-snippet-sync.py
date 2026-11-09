@@ -1,0 +1,194 @@
+"""
+verify-snippet-sync — CONSOLIDATED CLI trampoline over claude-klabauter
+coordinator_core.snippet_sync.verify, replacing the 7 retired
+`verify-<name>-sync.sh` scripts (reviewer-calibration, docs-checker-consumption,
+plan-coverage-check-consumption, prior-art-check-consumption,
+quota-self-detect-preamble, meta-ask-preamble, text-only-recovery-preamble).
+
+Usage:
+  verify-snippet-sync <name>            Verify all consumers match the canonical snippet.
+                                         Exit non-zero on mismatch/missing.
+  verify-snippet-sync <name> --check    Alias for the default mode (explicit).
+  verify-snippet-sync <name> --fix      Overwrite mismatched sentinel blocks with the
+                                         canonical snippet (auto-inserts on snippets with
+                                         allow_insert=True in registry.toml — currently
+                                         quota-self-detect-preamble only).
+  verify-snippet-sync <name> --list     List consumers. For registry-driven snippets this
+                                         is the CANONICAL UNIVERSE (all registered consumer
+                                         paths, regardless of current on-disk state); for
+                                         scan-driven snippets (meta-ask-preamble,
+                                         text-only-recovery-preamble) it is the discovered set.
+
+<name> must be enrolled in snippets/registry.toml (`snippet-registry list-snippets`
+enumerates the valid names).
+
+Env overrides:
+  CLAUDE_PLUGIN_ROOT        — plugin root (default: resolved via content_root(),
+                               see _resolve_plugin_root() docstring below)
+  COORDINATOR_CONTENT_ROOT  — overrides plugin-root-relative consumer resolution only
+                               (cache-install seam; sibling/conditional consumers stay
+                               anchored to the true plugin root regardless)
+  NODE_BIN                  — unused (no node dependency post-port; accepted+ignored
+                               for invocation-shape compatibility with old callers)
+
+Exit codes:
+  0  — verify: all consumers match / --fix: no unhandled errors / --list: printed
+  1  — business outcome (verify: at least one consumer MISSING/MISMATCH), OR a
+       transport failure: engine-root resolution, coordinator_core.snippet_sync.verify
+       import failure, or an unresolvable coordinator doctrine repo root (see _resolve_plugin_root()).
+  2  — CLI usage error (missing/`--help` argv)
+
+Spec backlink: DoE scratch/subagent-sandbox/bash-to-python-engine-migration/recipe-t3a-g3.md § 6
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+_BIN_DIR = os.path.dirname(os.path.abspath(__file__))
+_LIB_DIR = os.path.join(_BIN_DIR, "lib")
+_REPO_ROOT = os.path.dirname(os.path.dirname(_BIN_DIR))
+
+
+_BOOTSTRAP_DONE = False
+
+
+def _bootstrap_engine() -> None:
+    """Put `_REPO_ROOT` on `sys.path`, AND bootstrap `coordinator/bin/lib`
+    onto it via `import lib` -- idempotent, safe to call more than once.
+
+    What moved and what did not: this mutation used to run at MODULE scope,
+    which made every import of this file mutate the `sys.path` of a warm
+    server ~50 sessions share. Only the trigger moved; the `_REPO_ROOT`
+    value inserted is byte-for-byte the same.
+
+    The `import lib` call is NOT the same mutation carried over -- it is a
+    fix folded in here (2026-08-29 review-finding sweep, Finding 4). This
+    function used to insert `_REPO_ROOT` only, which reads as protection for
+    `_resolve_plugin_root()`'s `from coordinator_registry import ...` below
+    while providing none: `coordinator_registry` lives under
+    `coordinator/bin/lib/`, not the repo root, so that import resolved only
+    because `main()`'s own later `import lib` call happened to run first on
+    every real invocation path. A mid-module entry into `_resolve_plugin_root()`
+    that never reaches `main()` raised `ModuleNotFoundError` on
+    `coordinator_registry`.
+    """
+    global _BOOTSTRAP_DONE
+    if _BOOTSTRAP_DONE:
+        return
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
+    import lib  # noqa: F401 — bootstraps coordinator/bin/lib onto sys.path
+    _BOOTSTRAP_DONE = True
+
+
+def _resolve_plugin_root() -> Path:
+    """Resolve the plugin root (coordinator/) that owns snippets/ and the
+    consumer agent prompts this CLI checks for drift.
+
+    Env var CLAUDE_PLUGIN_ROOT wins if set, returned verbatim. Otherwise
+    resolves via content_root() (see that function's own docstring for its
+    registry/pointer resolution chain) and returns the coordinator content
+    root inside it, either layout (coordinator_data_root.content_root_for).
+
+    This does NOT derive from this script's own __file__ location. b644d5a9
+    migrated this executable to claude-klabauter while snippets/ (and every
+    registry-driven consumer prompt) stayed in coordinator-content-repo — self-location
+    now resolves to <claude-klabauter>/coordinator, which has no snippets/ at all. Do
+    not "restore" __file__-based resolution to regain parity with the
+    pre-migration layout — that parity is exactly what caused the break
+    once this file moved repos.
+
+    Fails loud (sys.exit(1)) if content_root() cannot resolve: this is a gate
+    script, not a never-block hook, so an unresolvable content root must not
+    degrade to a silent scan of the wrong tree.
+    """
+    _bootstrap_engine()
+    from coordinator_data_root import content_root_for
+    from coordinator_registry import _DoeUnresolvable, content_root
+
+    env = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if env:
+        return Path(env)
+    try:
+        root = content_root()
+    except _DoeUnresolvable as exc:
+        print(
+            "verify-snippet-sync: cannot resolve the coordinator content root "
+            f"({exc}). Set repos.content_root in the machine-local registry, "
+            "or set CLAUDE_PLUGIN_ROOT directly.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    content = content_root_for(root)
+    if content is not None:
+        return content
+    return Path(root) / "coordinator"
+
+
+def main(argv: "list[str] | None" = None) -> int:
+    _bootstrap_engine()
+    args = (sys.argv[1:] if argv is None else argv)
+    if "--help" in args or "-h" in args:
+        sys.stdout.write(__doc__ or "")
+        return 0
+    if not args:
+        sys.stderr.write(__doc__ or "")
+        return 2
+
+    name = args[0]
+    mode = args[1] if len(args) > 1 else "verify"
+
+    import lib  # noqa: F401 — bootstraps coordinator/bin/lib onto sys.path
+    from cc_invoke import require_dispatch_engine_on_path
+
+    try:
+        claude_klabauter_root = require_dispatch_engine_on_path()
+    except RuntimeError as exc:
+        print(f"verify-snippet-sync: engine-root resolution failed: {exc}", file=sys.stderr)
+        return 1
+    # LOAD-BEARING, NOT DEAD. Do not delete on an unused-import sweep: this line is
+    # what BINDS coordinator_core, and binding it HERE is the whole fix.
+    # require_dispatch_engine_on_path() above only mutates sys.path -- it imports
+    # nothing. Without this line the next import below (a binder module
+    # that resolves on the LOCATOR axis) wins the race and binds coordinator_core off
+    # the working tree instead of the dispatch root, and no later sys.path insert can
+    # rebind an already-imported package. Removing it restores a silent wrong-tree
+    # divergence that require_dispatch_engine_on_path now raises on.
+    # Why: docs/plans/2026-08-26-the-seam-reports-what-it-got.md C9,
+    # docs/research/engine-provenance-carrier-dependence.md
+    import coordinator_core  # noqa: F401
+    try:
+        from coordinator_core.snippet_sync.verify import run
+    except ImportError as exc:
+        print(
+            f"verify-snippet-sync: coordinator_core.snippet_sync.verify not importable: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    from machine_local_resolve import resolve_machine_local_bin
+
+    script_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+    plugin_root = _resolve_plugin_root()
+    content_root_env = os.environ.get("COORDINATOR_CONTENT_ROOT")
+    content_root = Path(content_root_env) if content_root_env else None
+
+    outcome = run(
+        name,
+        mode,
+        plugin_root=plugin_root,
+        content_root=content_root,
+        machine_local_bin=resolve_machine_local_bin(script_dir),
+    )
+
+    for line in outcome.lines:
+        print(Path(line).as_posix() if mode == "--list" else line)
+    for line in outcome.stderr_lines:
+        print(line, file=sys.stderr)
+    return outcome.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,157 @@
+
+
+row_id_key: "@stem"
+
+batch_key: [severity]
+
+priority:
+  field: severity
+  order: asc
+
+verdicts:
+  - fix
+  - already-fixed
+  - file-removed
+  - plan-weight
+  - plan-substrate-collision
+  - park
+  - wont-do
+  - yagni
+  - unclear-direction
+  - needs-judgment
+  - cross-repo
+
+
+hand_back_types:
+  - park
+  - wont-do
+  - yagni
+  - unclear-direction
+  - plan-substrate-collision
+  - cross-repo
+
+graph:
+  triage:
+    kind: triage
+    edges:
+      fix: fix
+      already-fixed: refute-close
+      file-removed: refute-close
+      plan-weight: baton
+      needs-judgment: needs-judgment
+      plan-substrate-collision: plan-substrate-collision
+      cross-repo: cross-repo
+      park: park
+      wont-do: wont-do
+      yagni: yagni
+      unclear-direction: unclear-direction
+    on_fail: needs-judgment
+
+  refute-close:
+    kind: refute-close
+    edges:
+      confirmed: commit
+    
+    
+    on_fail: fix
+
+  fix:
+    kind: fix
+    edges:
+      done: verify
+    on_fail: needs-judgment
+
+  verify:
+    kind: verify
+    edges:
+      pass: commit
+    
+    
+    on_fail: verify-failed
+    verify:
+      default: agent
+
+  commit:
+    kind: commit
+    edges: {}
+    on_fail: commit-failed
+
+closure:
+  status_field: status
+  closed_values:
+    fix: closed
+    refute-close: closed
+  stamp_fields: [closed_at, closed_by]
+
+
+triage_policy: |
+  relevance_first:
+    - "Re-confirm each row against HEAD: history since `created`, and whether the cited surface still shows the debt. still-open, already-fixed (needs the pattern shown absent on HEAD, tagged ran or inspected) or partially-addressed. partially-addressed is a fix signal, not a close."
+
+  defer_requires_evidence:
+    - "already-fixed needs the pattern shown gone on HEAD."
+    - "file-removed needs ls confirming absence."
+    - "plan-substrate-collision needs a named file collision with an actively-rewriting plan."
+    - "cross-repo needs the commit that moved the cited surface out and the receiving repo named; moved code is not fixed code, so never already-fixed or file-removed."
+    - "A PM or APM deferral is a schedule, not a resolution: a deferred row is never refute-closed on that ground."
+
+  not_defer_reasons:
+    - "summary-form"
+    - "P2/P3, or refactor flavour"
+    - "intersects an active plan, without a named file"
+    - "would take careful thought"
+
+  fix_eligibility:
+    - "fix only when the change is BOTH tradeoff-free AND non-structural (touches no module boundary, public op contract, or schema). Anything structural is plan-weight regardless of line count."
+
+  severity_classification:
+    - "Blocking other work -> P0. Wrong behaviour or a correctness risk -> P1. Otherwise P2; cosmetic -> P3. A missing severity is a triage input, never a default."
+
+  plan_weight_evidence:
+    - ">=3 files, a new module, a schema or op-contract change, or new fixtures."
+    - "A t-shirt size needs evidence on every record."
+
+  baton_prechecks:
+    - "Not a phantom: the pattern is gone on HEAD."
+    - "Not mis-sized: <=2 files and <50 lines, non-structural, is a fix, not a baton."
+
+  scope_calls:
+    - "YAGNI, won't-do and scope questions are PM calls: hand back as yagni / wont-do / unclear-direction with the one question the PM must answer, never close them in-run."
+
+  never_weaken_assertion:
+    - "Never weaken a test assertion to green without evidence it was wrong -- returns BLOCKED assertion-weakening-without-evidence."
+
+  tradeoff_marks_needs_judgment:
+    - "A record carrying a non-empty tradeoff statement goes to needs-judgment, regardless of size."
+
+appetite:
+  hunt:
+    where: [[["status", "==", "open"], ["severity", "==", "P0"]]]
+    concurrency: 2
+    extra_verification: true
+    batch_size: {default: 4}
+    triage_depth: deep
+    window: 1
+    max_agent_calls: 20
+
+  standard:
+    where: [[["status", "==", "open"], ["severity", "in", ["P0", "P1", "P2"]]]]
+    concurrency: 4
+    extra_verification: false
+    batch_size: {default: 4}
+    triage_depth: standard
+    window: 2
+    max_agent_calls: 40
+
+  sweep:
+    where: [[["status", "==", "open"]]]
+    concurrency: 16
+    extra_verification: true
+    batch_size: {P0: 2, P1: 6, P2: 10, P3: 12}
+    triage_depth: shallow
+    window: 4
+    max_agent_calls: 200
+
+archive_path: "archive/debt-backlog/"
+
+schema: debt-backlog.schema.json

@@ -1,0 +1,693 @@
+"""coordinator_registry — shared registry loader for coordinator doc-type and identity data.
+
+Single source of truth (SoT): schemas/coordinator-registry.manifest.json.
+Loaded lazily and cached once per process: importing this module reads no manifest; the
+first read of a manifest-derived name (module __getattr__) or a call to
+_central_canonical_id() resolves the path ladder and json.loads it. Callers still
+`from coordinator_registry import KNOWN_TYPES`. An absent or malformed manifest is an
+install-integrity failure and raises on that first read.
+
+Exposed names (reconstruction rules per manifest._reconstruction key):
+  KNOWN_TYPES         — frozenset of all recognized --type values
+  SIDECAR_TYPES       — frozenset of types that are plan sidecars
+  QUEUE_TYPES         — frozenset of queue-delegate types
+  REPO_ALIASES        — dict registryKey → shortname  (Python _REPO_KEY_ALIASES convention)
+  CENTRAL_RECEIVER_IDS — frozenset of valid central EM receiver identity strings
+  REDIRECT_ALIASES    — frozenset of DoE-canonical home/mirror redirect aliases
+                         (identity.redirectAliases; cross-repo-memo's former
+                         code-pinned _DOE_CANONICAL_REDIRECT_ALIASES literal.
+                         Cross-repo contract surface: the engine repo's
+                         coordinator_core/ops/fleet/_memo_resolver.py
+                         read_redirect_aliases() is a downstream consumer.)
+  RECEIVER_EM_ALIASES — dict shortname → registryKey  (inverse; for cross-repo-memo)
+  SIDECAR_SUFFIXES    — dict sidecar-type → filesystem suffix (e.g. "review" → "review")
+  DOC_TYPES           — raw docTypes tuple for callers needing schemaName/offerable fields
+
+Shared identity-resolution functions (canonical, importable by all 4 CLIs):
+  repo_key_to_em_id(key)                         — repos.<name> → <name>-em, with central anchor
+  em_id_for_root(root, repo_key_paths)            — repo root path → em-id string
+  _central_canonical_id()                        — the one canonical central-EM identity string
+                                                    (centralReceiverIds[0]); see docstring below
+  _same_path(a, b)                               — internal path-equality helper, importable by the CLIs that need direct comparison
+
+Shared state-root resolver (canonical, importable by all doctrine CLIs):
+  content_root()                     — coordinator content repo root (env REPO_CONTENT_ROOT
+                                        FIRST, so the documented override is a real override;
+                                        THEN machine-local repos.content_root (the canonical
+                                        anchor), THEN the codename-free rungs: content-root
+                                        pointer → marketplace cache → flat plugin layout →
+                                        CLAUDE_PLUGIN_ROOT (normalized, state/-gated) →
+                                        registry live_path (normalized, state/-gated) → raise.
+                                        REPO_CONTENT_ROOT is the documented override (ambient,
+                                        shell-exported by the engine repo's install surface).
+                                        The codename-free ladder must rank BELOW the registry
+                                        per DR-071 — see content_root()'s own docstring.
+  _DoeUnresolvable                   — raised when the content root is unresolvable; callers catch and WARN+skip (exit 0)
+"""
+from __future__ import annotations
+
+import functools
+import json
+import os
+import subprocess
+import sys
+
+_REGISTRY_LIB_DIR = os.path.dirname(os.path.abspath(__file__))
+if _REGISTRY_LIB_DIR not in sys.path:
+    sys.path.insert(0, _REGISTRY_LIB_DIR)
+
+from machine_local_impl_resolve import (  # noqa: E402
+    claude_home as _mlir_claude_home,
+    machine_local_bin_candidates as _mlir_machine_local_bin_candidates,
+    machine_local_impl_path as _mlir_machine_local_impl_path,
+    read_content_root_pointer as _mlir_read_content_root_pointer,
+    registry_get as _mlir_registry_get,
+)
+
+#                      in coordinator-content-repo, because schemas are CONTRACT and DR-047
+_MANIFEST_RELPATH = os.path.join("schemas", "coordinator-registry.manifest.json")
+_MANIFEST_PATH_DEFAULT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    _MANIFEST_RELPATH,
+)
+
+# so a single test-isolation set covers all callers (MACHINE_LOCAL_IMPL). Defined
+_REGISTRY_MACHINE_LOCAL_IMPL_ENV = "MACHINE_LOCAL_IMPL"
+
+
+def _registry_machine_local_impl() -> str:
+    """Return the path to _machine_local.py, settings-home first, honoring
+    MACHINE_LOCAL_IMPL for tests.
+
+    Delegates to machine_local_impl_resolve.machine_local_impl_path() — see
+    that module's docstring (DR-210 Amendment: "resolves nothing through
+    ~/.claude/bin"; this rung now tries settings-home before the mirror).
+    """
+    return _mlir_machine_local_impl_path(_REGISTRY_MACHINE_LOCAL_IMPL_ENV)
+
+
+def _registry_machine_local_get(key: str) -> str | None:
+    """Call machine-local get <key> and return the value, or None on failure.
+
+    In-process FIRST via machine_local_impl_resolve.registry_get(key) —
+    returned when truthy. Only on None does this fall through to the
+    existing subprocess spawn below, which stays the fallback rung.
+
+    Uses sys.executable (the interpreter running this module) — no subprocess
+    probing needed; safe on macOS, Linux, and Windows. CREATE_NO_WINDOW guard
+    suppresses the Windows console popup (portable: getattr resolves to 0 on
+    non-Windows).
+
+    Documented hazard (review F1, 2026-08-20): for `repos.*` keys, this
+    in-process rung's source-file ladder is `registry.local.toml` then
+    `registry.toml` (machine_local_impl_resolve.registry_get()) — but the
+    real `machine-local get repos.<slug>` CLI routes `repos.*` through a
+    4-rung ladder (REPO_<SLUG> env → marker autodiscovery →
+    path-exceptions.toml → registry.local.toml) that NEVER consults
+    registry.toml for this key class. registry.toml is install-mutable
+    (seeded from a template, then mutated in place by
+    _register_hardware_concern and cockpit-key notices), so a stale non-empty
+    `repos.*` row there can short-circuit this rung and return a value the
+    CLI's ladder would never have produced — not merely a reordering that is
+    "precedence-preserving at the value level," since the CLI's ladder does
+    not have a registry.toml rung to be equivalent to. Inherited from the
+    shared oracle reader and already ratified at 5 other repos.* call sites
+    (gen_claude_author_shim.py, content_root.py, new_project_scaffold.py,
+    render_template_tree.py, repo_bootstrap.py) — not invented here. Do NOT
+    fix by skipping registry.toml for repos.* keys in this function; that is
+    a separate, deliberately deferred cross-site change (all 6 sites
+    together), not a local patch.
+    """
+    # MACHINE_LOCAL_IMPL, when explicitly set, governs this function ENTIRELY
+    if not (os.environ.get(_REGISTRY_MACHINE_LOCAL_IMPL_ENV) or "").strip():
+        _in_process = _mlir_registry_get(key)
+        if _in_process:
+            return _in_process
+    impl = _registry_machine_local_impl()
+    cmd = [sys.executable, impl, "get", key]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return result.stdout.strip()
+
+
+def _mp_candidate_manifest_path(root: str) -> str | None:
+    for _relpath in (
+        _MANIFEST_RELPATH,
+        os.path.join("coordinator", _MANIFEST_RELPATH),
+    ):
+        _candidate = os.path.join(root, _relpath)
+        if os.path.exists(_candidate):
+            return _candidate
+    return None
+
+
+def _mp_content_root_pointer_rung() -> str:
+    """Codename-free rungs 1-2: the content-root pointer file reads, via
+    `machine_local_impl_resolve.read_content_root_pointer()` (settings-home
+    `machine-local` first, then `~/.claude`; returns "" on failure, never
+    raises). Pure file I/O — no subprocess, preserving import-time purity.
+    """
+    return _mlir_read_content_root_pointer()
+
+
+def _mp_repo_root_from_plugin_root_candidate(candidate: str, *, allow_unchanged_fallback: bool = True) -> str:
+    """Normalize a CLAUDE_PLUGIN_ROOT-shaped value to the coordinator REPO
+    root that content_root() callers expect.
+
+    Single-sourced (state/debt-backlog/2026-08-08-three-divergent-copies-of-
+    the-plugin-roo-8d584d3b90d3.yaml): delegates to coordinator_core.
+    _content_root_primitive.repo_root_from_plugin_root_candidate() (the same
+    engine package this file already imports coordinator_core from, via
+    _same_path() below — no new import edge), with THIS copy's own historical
+    shape reproduced exactly via keyword args: drive_root_guard="normpath"
+    (os.path.normpath()-based, NOT the B7 bare-drive-root truncation guard —
+    see that function's `drive_root_guard` parameter note),
+    basename_compare="casefold" (case-insensitive on every platform, unlike
+    the engine default's Windows-only normcase compare — see its
+    `basename_compare` parameter note),
+    manifest_relpath_fallback=False (this copy never carried the B5 fix),
+    allow_unchanged_fallback=<this function's own kwarg>.
+
+    Do NOT edit coordinator_core's copy of this helper to "fix" the two
+    flagged divergences above under cover of this refactor — they are
+    reported to the EM/PM, not resolved, pending a decision on whether they
+    are intentional or latent bugs.
+
+    CLAUDE_PLUGIN_ROOT is a *content* root (see
+    resolve_coordinator_clone.py::resolve_content_root() rung 1, and its
+    content-root pointer rung which returns `<repo_root>/coordinator`) — in
+    the private/dev layout this is `<repo_root>/coordinator`, one level
+    below the repo root content_root() must return (state/ hangs off the repo
+    root, never off the coordinator/ subdir — see content_root()'s own
+    negative-spec). In the OSS flat layout the content root and the repo
+    root coincide (manifest ships flat at plugin root, no coordinator/
+    prefix — this module's "Two live layouts" docstring note).
+
+    Disambiguate the same way _mp_flat_layout_probe_rung() does: gate on the
+    `.claude-plugin/plugin.json` marketplace marker. If it sits directly
+    under `candidate`, candidate already IS the repo root (OSS flat case).
+    If it sits one level up (candidate's basename is "coordinator" and the
+    marker is beside it), the repo root is the parent (private/dev layout).
+
+    `allow_unchanged_fallback` (Review: staff-eng BLOCKER-2) — True
+    (default; the manifest-bootstrap ladder's use, gated afterward by a
+    manifest-presence probe) returns `candidate` unchanged when neither
+    shape matches. False (content_root()'s rungs 4-5, which have no downstream
+    manifest gate) returns "" instead — an unrecognizable candidate must not
+    silently win over an operator's explicit override just because
+    os.path.isdir() happens to be true.
+
+    Normalizes via os.path.normpath before
+    stripping trailing separators (a bare rstrip strips a trailing separator
+    off a bare drive-letter root, leaving a form Windows resolves as
+    CWD-relative rather than the drive root) and casefolds the "coordinator"
+    basename compare (a
+    case-insensitive filesystem can hand back "...\\Coordinator", which a
+    case-sensitive == would miss, falling through to the unchanged-candidate
+    branch and reintroducing the content-root bug C1E fixed one rung up).
+    """
+    if _REGISTRY_LIB_DIR not in sys.path:
+        sys.path.insert(0, _REGISTRY_LIB_DIR)
+    import cc_invoke
+
+    cc_invoke.ensure_engine_on_path(__file__)
+    from coordinator_core._content_root_primitive import repo_root_from_plugin_root_candidate
+
+    return repo_root_from_plugin_root_candidate(
+        candidate,
+        drive_root_guard="normpath",
+        basename_compare="casefold",
+        manifest_relpath_fallback=False,
+        allow_unchanged_fallback=allow_unchanged_fallback,
+    )
+
+
+def _mp_flat_layout_probe_rung() -> str:
+    """Codename-free rung: the flat `~/.claude/plugins/coordinator-claude`
+    marketplace-clone layout, gated on the `.claude-plugin/plugin.json`
+    marker (same marker `resolve_coordinator_clone.py::_resolve_source_mode`
+    gates its OSS-install check on). Implemented inline rather than importing
+    `coordinator_core.resolve_coordinator_clone` — this module's manifest
+    bootstrap runs at IMPORT time and must stay filesystem-and-env only;
+    importing a coordinator_core module here is not viable to verify as
+    side-effect-free at that phase, so the marker check is duplicated instead.
+
+    NOT where Claude Code actually installs a marketplace clone (Review:
+    staff-eng MINOR-7) — see _mp_marketplace_cache_rung() below for the real
+    install location. Retained because it is a real layout this codebase's
+    own install/uninstall/sandbox-check tooling produces.
+
+    Home resolution delegates to the canonical _mlir_claude_home() (Review:
+    staff-eng MINOR-7 secondary) rather than a hand-rolled
+    CLAUDE_HOME-or-HOME-or-USERPROFILE chain — this file already imports it,
+    and a second, slightly different home ladder in the same module drifts
+    from the settings-home-aware canonical version silently.
+    """
+    _home = _mlir_claude_home()
+    if not _home:
+        return ""
+    _candidate = os.path.join(_home, "plugins", "coordinator-claude")
+    _marker = os.path.join(_candidate, ".claude-plugin", "plugin.json")
+    return _candidate if os.path.isfile(_marker) else ""
+
+
+def _mp_marketplace_cache_rung() -> str:
+    """Codename-free rung: Claude Code's REAL marketplace-install location —
+    `<claude_home>/plugins/cache/coordinator-claude/coordinator/<version>/`,
+    newest version wins (numeric compare, DR-148-safe). Mirrors
+    `resolve_coordinator_clone._newest_cache_dir()` inline rather than
+    importing `coordinator_core` — same import-time-purity reasoning as
+    `_mp_flat_layout_probe_rung()` above; this module's manifest bootstrap
+    runs at IMPORT time and must stay filesystem-and-env only.
+
+    `_mp_flat_layout_probe_rung()`'s
+    candidate is not where Claude Code installs a marketplace plugin; this
+    is. Without this rung, a direct-CLI invocation on a real OSS install (no
+    content-root pointer, no CLAUDE_PLUGIN_ROOT, no machine-local registry)
+    has no live rung left and the manifest bootstrap fails loud on
+    install-integrity — the defect this workstream exists to close.
+
+    Resolves to the repo root directly (OSS-flat shaped: schemas/ sits
+    directly under the version dir) — no normalization needed before use.
+    """
+    _home = _mlir_claude_home()
+    if not _home:
+        return ""
+    _cache_parent = os.path.join(_home, "plugins", "cache", "coordinator-claude", "coordinator")
+    if not os.path.isdir(_cache_parent):
+        return ""
+    _best = ""
+    _best_key: tuple[int, int, int] | None = None
+    try:
+        _entries = os.listdir(_cache_parent)
+    except OSError:
+        return ""
+    for _name in _entries:
+        _child = os.path.join(_cache_parent, _name)
+        if not os.path.isdir(_child):
+            continue
+        _parts = _name.split(".")
+        if len(_parts) > 3 or any(not _part.isdigit() for _part in _parts):
+            continue
+        _nums = [int(_part) for _part in _parts] + [0] * (3 - len(_parts))
+        _key = (_nums[0], _nums[1], _nums[2])
+        if _best_key is None or _key > _best_key:
+            _best_key = _key
+            _best = _child
+    return _best
+
+
+def _mp_live_path_rung() -> str:
+    """The plugin mirror's live path, read in-process; the CLI spawn runs only under an explicit MACHINE_LOCAL_IMPL."""
+    _key = "plugin.mirrors.coordinator-claude.live_path"
+    if (os.environ.get(_REGISTRY_MACHINE_LOCAL_IMPL_ENV) or "").strip():
+        return _registry_machine_local_get(_key) or ""
+    return _mlir_registry_get(_key) or ""
+
+
+@functools.lru_cache(maxsize=None)
+def _load_manifest() -> dict:
+    """Resolve, read and validate the registry manifest once per process.
+
+    Returns the manifest-derived public names plus `_MANIFEST_PATH`. Absent,
+    malformed, or key-incomplete manifests raise (install-integrity failure).
+    """
+    _manifest_path = _MANIFEST_PATH_DEFAULT
+    if not os.path.exists(_manifest_path):
+        _doe = os.environ.get("REPO_CONTENT_ROOT", "").strip()
+        if not _doe:
+            _doe = _mlir_registry_get("repos.content_root") or ""
+        if not _doe:
+            for _ml_cand in _mlir_machine_local_bin_candidates():
+                if not os.path.exists(_ml_cand):
+                    continue
+                try:
+                    _mlres = subprocess.run(
+                        [_ml_cand, "get", "repos.content_root"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                    if _mlres.returncode == 0:
+                        _doe = _mlres.stdout.strip()
+                except (OSError, subprocess.SubprocessError):
+                    _doe = ""
+                if _doe:
+                    break
+        if _doe:
+            _candidate = _mp_candidate_manifest_path(_doe)
+            if _candidate:
+                _manifest_path = _candidate
+
+    if not os.path.exists(_manifest_path):
+        for _mp_root in (
+            _mp_content_root_pointer_rung(),
+            _mp_marketplace_cache_rung(),
+            _mp_flat_layout_probe_rung(),
+            os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip(),
+            _mp_live_path_rung(),
+        ):
+            if not _mp_root or not os.path.isdir(_mp_root):
+                continue
+            _mp_manifest_cand = _mp_candidate_manifest_path(_mp_root)
+            if _mp_manifest_cand:
+                _manifest_path = _mp_manifest_cand
+                break
+
+    # Last-resort rung: the OSS mirror carries no coordinator-content-repo checkout; the
+    # vendored byte-copy is consulted only after every live rung has missed.
+    if not os.path.exists(_manifest_path):
+        _mp_vendored = os.path.join(_REGISTRY_LIB_DIR, "_vendor", "coordinator-registry.manifest.json")
+        if os.path.exists(_mp_vendored):
+            _manifest_path = _mp_vendored
+
+    try:
+        with open(_manifest_path, encoding="utf-8") as _f:
+            _manifest = json.load(_f)
+    except FileNotFoundError as _e:
+        raise FileNotFoundError(
+            f"coordinator_registry: manifest not found at {_manifest_path!r}, and no "
+            "REPO_CONTENT_ROOT-resolvable candidate located one either. "
+            "This is an install-integrity failure — ensure the coordinator plugin is "
+            "fully installed, or set REPO_CONTENT_ROOT to the schemas-hosting repo's root."
+        ) from _e
+    except json.JSONDecodeError as _e:
+        raise ValueError(
+            f"coordinator_registry: manifest at {_manifest_path!r} is malformed JSON: {_e}. "
+            "This is an install-integrity failure — do not hand-edit the manifest."
+        ) from _e
+
+    try:
+        _doc_types: list[dict] = _manifest["docTypes"]
+        _queue_types_list: list[str] = _manifest["queueTypes"]
+        _identity: dict = _manifest["identity"]
+    except KeyError as _e:
+        raise ValueError(
+            f"coordinator_registry: manifest at {_manifest_path!r} is missing required key: {_e}. "
+            "This is an install-integrity failure — do not hand-edit the manifest."
+        ) from _e
+
+    try:
+        _repo_aliases_raw = _identity["repoAliases"]
+        _central_receiver_ids_raw = _identity["centralReceiverIds"]
+    except KeyError as _e:
+        raise ValueError(
+            f"coordinator_registry: manifest at {_manifest_path!r} is missing required identity key: {_e}. "
+            "This is an install-integrity failure — do not hand-edit the manifest."
+        ) from _e
+
+    # The literal is a FALLBACK DEFAULT for manifests predating redirectAliases.
+    _redirect_aliases_raw = _identity.get(
+        "redirectAliases",
+        [".claude-em", "claude-home", "coordinator-claude", "coordinator-claude-em"],
+    )
+    return {
+        "_MANIFEST_PATH": _manifest_path,
+        "KNOWN_TYPES": frozenset(d["type"] for d in _doc_types) | frozenset(_queue_types_list),
+        "SIDECAR_TYPES": frozenset(d["type"] for d in _doc_types if d["isSidecar"]),
+        "QUEUE_TYPES": frozenset(_queue_types_list),
+        "REPO_ALIASES": {a["registryKey"]: a["shortname"] for a in _repo_aliases_raw},
+        "CENTRAL_RECEIVER_IDS": frozenset(_central_receiver_ids_raw),
+        "REDIRECT_ALIASES": frozenset(
+            a.strip().lower() for a in _redirect_aliases_raw if isinstance(a, str) and a.strip()
+        ),
+        "RECEIVER_EM_ALIASES": {a["shortname"]: a["registryKey"] for a in _repo_aliases_raw},
+        "SIDECAR_SUFFIXES": {
+            d["type"]: d["suffix"] for d in _doc_types if d.get("isSidecar") and "suffix" in d
+        },
+        "DOC_TYPES": tuple(_doc_types),
+        "_CENTRAL_CANONICAL_ID": _central_receiver_ids_raw[0],
+    }
+
+
+_LAZY_NAMES = frozenset(
+    {
+        "_MANIFEST_PATH",
+        "KNOWN_TYPES",
+        "SIDECAR_TYPES",
+        "QUEUE_TYPES",
+        "REPO_ALIASES",
+        "CENTRAL_RECEIVER_IDS",
+        "REDIRECT_ALIASES",
+        "RECEIVER_EM_ALIASES",
+        "SIDECAR_SUFFIXES",
+        "DOC_TYPES",
+    }
+)
+
+
+def __getattr__(name: str):
+    """PEP 562: serve the manifest-derived names, loading the manifest on first read."""
+    if name in _LAZY_NAMES:
+        return _load_manifest()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _central_canonical_id() -> str:
+    """The single canonical central-EM identity string.
+
+    Derived from identity.centralReceiverIds[0] in the manifest — index 0 is
+    canonical by convention (mirrors DoE's frontmatter validator, which derives
+    its own canonical id the same way: centralReceiverIds[0]). All OTHER entries
+    in the list remain valid receiver aliases (see CENTRAL_RECEIVER_IDS, which
+    membership-tests the full set) — this helper exists only to name the ONE
+    preferred value callers should emit/display, not to narrow what's accepted.
+
+    Negative-spec: do not hardcode "coordinator-content-repo-em" (or any central-em string) as
+    a bare literal anywhere that needs the canonical id — derive it from here so
+    a future manifest re-ordering of centralReceiverIds propagates automatically.
+    """
+    return _load_manifest()["_CENTRAL_CANONICAL_ID"]
+
+
+def _same_path(a: str, b: str) -> bool:
+    if _REGISTRY_LIB_DIR not in sys.path:
+        sys.path.insert(0, _REGISTRY_LIB_DIR)
+    import cc_invoke
+
+    cc_invoke.ensure_engine_on_path(__file__)
+    from coordinator_core.win_portability import same_path
+
+    return same_path(a, b)
+
+
+def _canonical_repo_key_for_root(root: str, repo_key_paths: dict[str, str]) -> str | None:
+    if _REGISTRY_LIB_DIR not in sys.path:
+        sys.path.insert(0, _REGISTRY_LIB_DIR)
+    import cc_invoke
+
+    cc_invoke.ensure_engine_on_path(__file__)
+    from coordinator_core.machine_resolver import canonical_repo_key_for_root
+
+    return canonical_repo_key_for_root(root, repo_key_paths)
+
+
+def repo_key_to_em_id(key: str) -> str:
+    """Reverse a repos.<name> registry key to its EM identity string.
+
+    Special-case: repos.content_root → the manifest-derived canonical central
+    identity (see _central_canonical_id() — identity.centralReceiverIds[0],
+    currently "coordinator-content-repo-em"). "claude-central-em", "central-em" and "central"
+    were RETIRED OUTRIGHT from identity.centralReceiverIds by DoE at their
+    b787bf0f0 (2026-08-26): they are not aliases, not members of
+    CENTRAL_RECEIVER_IDS, and do not resolve — their absence is the operative
+    rule and a send to one is meant to fail loudly. Sequenced with this repo's
+    own test_central_receiver_ids narrowing at 4164ae195.
+
+    Otherwise applies REPO_ALIASES for doctrine-shortname divergence (e.g.
+    example_game_workbench_repo → example-game-repo → example-game-repo-em), then converts remaining
+    underscores to dashes.
+
+    Callers are expected to pass fully-qualified `repos.<name>` keys; bare keys
+    are handled defensively but unsupported.
+
+    Negative-spec: the ~/.claude/home path is NOT special-cased here — central
+    identity is anchored on repos.content_root, not the home directory.
+    """
+    if _REGISTRY_LIB_DIR not in sys.path:
+        sys.path.insert(0, _REGISTRY_LIB_DIR)
+    import cc_invoke
+
+    cc_invoke.ensure_engine_on_path(__file__)
+    from coordinator_core.machine_resolver import repo_key_to_em_id as _repo_key_to_em_id
+
+    return _repo_key_to_em_id(key)
+
+
+def em_id_for_root(root: str | None, repo_key_paths: dict[str, str]) -> str:
+    if _REGISTRY_LIB_DIR not in sys.path:
+        sys.path.insert(0, _REGISTRY_LIB_DIR)
+    import cc_invoke
+
+    cc_invoke.ensure_engine_on_path(__file__)
+    from coordinator_core.machine_resolver import em_id_for_root as _em_id_for_root
+
+    return _em_id_for_root(root, repo_key_paths)
+
+
+# CONCERN-BOUNDARY: content_root() (state-root axis) is INDEPENDENT of
+
+# Env var for REPO_CONTENT_ROOT override — the documented, ambient name. Every
+# hatch. Guard form: os.environ.get(_REPO_CONTENT_ROOT_ENV, "").strip() — non-empty string wins.
+_REPO_CONTENT_ROOT_ENV = "REPO_CONTENT_ROOT"
+
+# _REGISTRY_MACHINE_LOCAL_IMPL_ENV is defined earlier, ahead of the manifest
+# _REGISTRY_CLAUDE_HOME_ENV constant was deleted here: dead since
+# (hardcodes "CLAUDE_HOME" internally).
+
+
+class _DoeUnresolvable(RuntimeError):
+    """Raised when the content root cannot be resolved via env var (REPO_CONTENT_ROOT)
+    or machine-local registry.
+
+    Callers in the doctrine central write loop catch this and degrade gracefully
+    (WARN + skip, exit 0). The resolver itself fails loud via this exception;
+    this is the caller-layer resilience wrapper.
+
+    Negative-spec: this exception is NOT raised for per-project (cwd-relative) writes —
+    only for central doctrine writes that require the DoE repo root.
+
+    Spec backlink: coordinator-content-repo:pln-gate-2-w2-3-live-caller-switch-3e51cf § C1
+    """
+
+
+def _registry_claude_home() -> str:
+    """Return the ~/.claude root, honoring CLAUDE_HOME env var for test isolation.
+
+    Delegates to machine_local_impl_resolve.claude_home() — see that module's
+    docstring for why the settings-home-first ladder now lives there, shared
+    across every caller that used to hand-roll this same join.
+    """
+    return _mlir_claude_home()
+
+
+def content_root() -> str:
+    """Resolve the coordinator content repo root for central-state writes.
+
+    Resolution chain — Review: staff-eng MAJOR-4 put the explicit env-var
+    override rung FIRST, ahead of the codename-free rungs, restoring
+    "REPO_CONTENT_ROOT is the documented override" as true fact (an
+    operator's stated intent cannot be present by accident; ambient
+    file/registry state must not outrank it).
+
+    DR-071 reorder (2026-08-10): the machine-local `repos.content_root`
+    registry rung runs immediately after the env override and AHEAD of
+    the codename-free ladder. Previously this rung ran LAST, so a codename-free
+    candidate that also happened to resolve (a stale marketplace install
+    left from an earlier `coordinator:install`, or a genuinely published/
+    scrubbed plugin cache) silently outranked the registry's correctly
+    registered content tree.
+
+      1.  REPO_CONTENT_ROOT env var — the documented, ambient override name every
+          coordinator_core referent binds (see _REPO_CONTENT_ROOT_ENV above). If
+          non-empty, trusted as-is.
+      2.  machine-local get repos.content_root — the DR-071 canonical,
+          authoritative coordinator-root anchor. Delegates to the §4c
+          discovery ladder via the same _machine_local.py reader the identity
+          flip uses.
+      3-4. Content-root pointer (durable settings-home, then `~/.claude`) —
+           see _mp_content_root_pointer_rung(). Returns the content REPO root
+           directly, no conversion needed. Only reached when rung 2
+           returns nothing.
+      5.  Claude Code's real marketplace-cache install location — see
+          _mp_marketplace_cache_rung() (Review: staff-eng BLOCKER-1).
+          Resolves to the repo root directly, same contract as rung 6.
+      6.  Flat `~/.claude/plugins/coordinator-claude` marketplace-clone layout
+          — see _mp_flat_layout_probe_rung(). resolve_coordinator_clone.py
+          treats this same path as the repo/clone root directly (its
+          resolve_clone_root() rung 4), so it is used as-is here too. Gated
+          (Review: staff-eng BLOCKER-2) on `<cand>/state` being a directory —
+          this ladder promises callers a root state/ hangs off, not merely
+          any directory that satisfies the marker check.
+      7.  CLAUDE_PLUGIN_ROOT — a *content* root, not necessarily the repo
+          root (see resolve_content_root()'s `<root>/coordinator` shape for
+          the private/dev layout). Normalized via
+          _mp_repo_root_from_plugin_root_candidate(allow_unchanged_fallback=False)
+          before use (Review: staff-eng BLOCKER-2 — an unrecognized
+          candidate yields "", never itself: CLAUDE_PLUGIN_ROOT names
+          whichever plugin's hook/command is currently executing, which is
+          routinely a DIFFERENT plugin than coordinator; passing it through
+          unchanged let an unrelated repo win over an explicit correct
+          override). Also gated on `<cand>/state` being a directory.
+      8.  machine-local `plugin.mirrors.coordinator-claude.live_path` —
+          This is the SAME class of value as
+          CLAUDE_PLUGIN_ROOT (a content root in the private/dev layout,
+          `<repo_root>/coordinator`) and is now routed through the same
+          normalizer + state/ gate rather than trusted as a repo root
+          unconverted. resolve_coordinator_clone.py's resolve_clone_root()
+          does NOT, in fact, use this value directly as claimed by earlier
+          commit messages in this workstream — its rung 2 gates on
+          `os.path.isdir(os.path.join(live, ".git"))`, which is exactly the
+          check that filters a content root out; this rung reproduces that
+          intent via the repo-root normalizer instead.
+      None of rungs 3-8 contain a private codename, so the OSS depersonalize
+      scrub cannot touch them directly — mirrors the manifest bootstrap
+      ladder above — but per DR-071 they must still rank BELOW rung 2's
+      registry anchor, since a codename-free rung is reachable through a
+      genuinely published/scrubbed install.
+      9.  Raises _DoeUnresolvable when no rung resolves.
+
+    Returns the content REPO root. Callers append state/<class>/ to build the
+    full write path:
+      os.path.join(content_root(), "state", "lessons-outbox")
+      os.path.join(content_root(), "state", "improvement-queue")
+
+    Negative-spec: the state/ subdirectory is NOT included in the return value.
+    Callers must NOT pass the return value to os.path.join(..., "state", "state", ...).
+
+    Negative-spec: INDEPENDENT of em_id_for_root/_resolve_from_repo() — both use
+    repos.content_root but for orthogonal axes (state-root vs. identity). Do NOT merge.
+
+    Spec backlink: coordinator-content-repo:pln-gate-2-w2-3-live-caller-switch-3e51cf § C1
+    Spec backlink: pln-the-published-engine-resolves-ae0bf7 § C1D
+    """
+    override = os.environ.get(_REPO_CONTENT_ROOT_ENV, "").strip()
+    if override:
+        return override
+
+    val = _registry_machine_local_get("repos.content_root")
+    if val:
+        return val
+
+    _dr_pointer_root = _mp_content_root_pointer_rung()
+    if _dr_pointer_root and os.path.isdir(_dr_pointer_root):
+        return _dr_pointer_root
+
+    for _dr_root in (
+        _mp_marketplace_cache_rung(),
+        _mp_flat_layout_probe_rung(),
+    ):
+        if _dr_root and os.path.isdir(_dr_root) and os.path.isdir(os.path.join(_dr_root, "state")):
+            return _dr_root
+
+    _dr_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
+    if _dr_plugin_root:
+        _dr_normalized = _mp_repo_root_from_plugin_root_candidate(_dr_plugin_root, allow_unchanged_fallback=False)
+        if _dr_normalized and os.path.isdir(_dr_normalized) and os.path.isdir(os.path.join(_dr_normalized, "state")):
+            return _dr_normalized
+
+    _dr_live_path = _registry_machine_local_get("plugin.mirrors.coordinator-claude.live_path") or ""
+    if _dr_live_path:
+        _dr_live_normalized = _mp_repo_root_from_plugin_root_candidate(_dr_live_path, allow_unchanged_fallback=False)
+        if (
+            _dr_live_normalized
+            and os.path.isdir(_dr_live_normalized)
+            and os.path.isdir(os.path.join(_dr_live_normalized, "state"))
+        ):
+            return _dr_live_normalized
+
+    raise _DoeUnresolvable(
+        "repos.content_root not set in machine-local registry and "
+        "REPO_CONTENT_ROOT env var not set"
+    )

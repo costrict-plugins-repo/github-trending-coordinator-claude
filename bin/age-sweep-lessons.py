@@ -1,0 +1,282 @@
+"""Age-archive aged [universal] entries from state/lessons/*.yaml.
+
+WHY THIS EXISTS
+---------------
+`state/lessons/` is read by `/learn-lessons`, the central-mode strip-local pull-pass,
+and the PM-invoked `/workstream-start` ceremony (it is NOT a Tier-0 boot read; see
+the coordinator doctrine repo's coordinator/docs/wiki/tiered-context-loading.md § 2. The Five Tiers,
+negative spec "`state/lessons/` is NOT Tier 0" — coordinator/CLAUDE.md § Session
+Orientation retired 2026-07-27). It is a capture queue: local-mode
+`/learn-lessons` folds recent lessons to wikis but historically had no step that
+*bounds the directory's size*, so it grows unbounded and each consumer pays a
+proportional listing tax.
+
+A `[universal]` lesson's canonical home is the CENTRAL coordinator wikis (promoted
+by central-mode `/learn-lessons`, surfaced to planners by the prior-art-checker
+pre-flight). Once an entry is older than the central promotion window, keeping it
+in `state/lessons/` is redundant: its durable home is central, and git history is
+the recovery net. So we age-archive aged universals and KEEP everything else.
+
+PARTITION (per YAML entry, per `scope` and `created` fields)
+  ARCHIVE  iff  scope == universal  AND  has a `created` date  AND  date < cutoff
+  KEEP     otherwise:
+             - project-specific entries (no central home) — any age
+             - entries without `created` (can't prove aged) — conservative keep
+             - universals within the window (may not be promoted yet)
+
+Archival is via `git mv` to `archive/lessons/<YYYY-MM>/` (one YAML file per entry,
+preserving git history). Unlike the old monolithic-file approach, no file is rewritten
+— only the aged entries are moved.
+
+Spec backlink: docs/plans/2026-06-30-lessons-md-to-queryable-yaml-queue.md § C3a
+
+SAFETY
+  - Default DRY-RUN. `--apply` is required to write.
+  - Archive moves files to <repo>/archive/lessons/YYYY-MM/ via `git mv` (git-tracked).
+  - Operates on one directory listing; each `git mv` is atomic per file.
+
+CUTOFF
+  --before YYYY-MM-DD   explicit cutoff (preferred: pass the last central-run
+                        date so only entries that already had a promotion
+                        opportunity are swept).
+  --days N              explicit conservative floor: cutoff = today - N days.
+                        NO default — one of --before / --days is required, since
+                        there is no safe silent age window. Prefer --before.
+
+Usage:
+  age-sweep-lessons.py <repo-root-or-lessons-dir> [--before DATE | --days N]
+                       [--archive-dir DIR] [--apply]
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+def _resolve_lessons_dir(arg: Path) -> Path:
+    """Accept either a repo root or a direct path to the lessons directory."""
+    if arg.is_dir() and arg.name == "lessons":
+        return arg
+    cand = arg / "state" / "lessons"
+    if cand.is_dir():
+        return cand
+    raise FileNotFoundError(
+        f"no state/lessons/ directory at {arg} or {cand}; "
+        f"pass a repo root or the state/lessons/ directory directly"
+    )
+
+
+def partition(
+    lessons_dir: Path, cutoff: str
+) -> tuple[list[tuple[Path, str]], list[Path], int]:
+    """Partition YAML files into (archive_entries, keep_files, total_count).
+
+    archive_entries: list of (yaml_path, date_str) — aged universal entries to archive
+    keep_files:      list of yaml_path — entries that stay in state/lessons/
+    total_count:     total YAML files scanned
+
+    ARCHIVE iff scope=='universal' AND created date present AND date < cutoff.
+    KEEP otherwise — conservative for missing scope, missing date, project-scoped entries.
+    """
+    import yaml
+
+    yaml_files = sorted(lessons_dir.glob("*.yaml"))
+    archive_entries: list[tuple[Path, str]] = []
+    keep_files: list[Path] = []
+
+    for f in yaml_files:
+        try:
+            fm = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            print(f"warning: skipping malformed YAML {f.name}: {e}", file=sys.stderr)
+            keep_files.append(f)
+            continue
+
+        created = fm.get("created")
+        date = str(created) if created is not None else None
+        if date == "0000-00-00":
+            date = None
+        scope = str(fm.get("scope", "")).strip()
+        is_uni = scope == "universal"
+
+        if is_uni and date and date < cutoff:
+            archive_entries.append((f, date))
+        else:
+            keep_files.append(f)
+
+    return archive_entries, keep_files, len(yaml_files)
+
+
+def main(argv: list[str]) -> int:
+    import lib  # noqa: F401 — bootstraps coordinator/bin/lib onto sys.path
+    import cc_invoke
+
+    cc_invoke.ensure_engine_on_path(__file__)
+
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("path", type=Path,
+                    help="repo root or path to state/lessons/ directory")
+    # Cutoff is REQUIRED — there is no safe silent default.
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--before", default=None,
+                   help="cutoff YYYY-MM-DD (entries dated < this are swept) — PREFERRED: pass the last central-run date")
+    g.add_argument("--days", type=int, default=None,
+                   help="explicit fallback: cutoff = today - N days (no default; --before preferred)")
+    ap.add_argument("--archive-dir", type=Path, default=None,
+                    help="archive dir (default <repo>/archive/lessons/<YYYY-MM>/)")
+    ap.add_argument("--apply", action="store_true", help="move files (default dry-run)")
+    args = ap.parse_args(argv)
+
+    try:
+        lessons_dir = _resolve_lessons_dir(args.path)
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    if args.before is not None:
+        cutoff = args.before.strip()
+        if not cutoff:
+            print("error: --before is empty — cutoff could not be determined. "
+                  "The caller should SKIP the age-sweep (no completed central run "
+                  "reachable), not invoke with a blank cutoff.", file=sys.stderr)
+            return 2
+    else:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=args.days)).strftime("%Y-%m-%d")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", cutoff):
+        print(f"error: cutoff '{cutoff}' is not a YYYY-MM-DD date", file=sys.stderr)
+        return 2
+
+    archive_entries, keep_files, total = partition(lessons_dir, cutoff)
+
+    print(f"age-sweep  {lessons_dir}")
+    print(f"  cutoff                   : {cutoff}  ({'--before' if args.before else f'--days {args.days}'})")
+    print(f"  entries seen             : {total}")
+    print(f"  ARCHIVE (aged universal) : {len(archive_entries)}")
+    print(f"  KEEP                     : {len(keep_files)}")
+
+    if not archive_entries:
+        print("  nothing aged out — no-op.")
+        return 0
+
+    if not args.apply:
+        print("  [DRY-RUN] no files moved. Pass --apply to move.")
+        for f, date in archive_entries:
+            print(f"    would archive: {f.name} (dated {date})")
+        return 0
+
+    repo_root = lessons_dir.resolve().parent.parent
+
+    now = datetime.now(timezone.utc)
+    ym = now.strftime("%Y-%m")
+    adir = args.archive_dir or (repo_root / "archive" / "lessons" / ym)
+    adir.mkdir(parents=True, exist_ok=True)
+
+    from coordinator_core.win_portability import no_console_creationflags
+
+    archived = _batched_git_mv_into_dir(
+        [src for src, _date in archive_entries], adir, repo_root, no_console_creationflags()
+    )
+    if archived is None:
+        return 1
+    committed = _commit_moved(
+        [src for src, _date in archive_entries], adir, repo_root, no_console_creationflags()
+    )
+    if not committed:
+        return 1
+    for src, _date in archive_entries:
+        print(f"  [APPLIED] archived {src.name} -> {adir / src.name}")
+
+    print(f"  [APPLIED] moved {archived} entries to {adir}")
+    return 0
+
+
+def _commit_moved(srcs: list, dst_dir, repo_root, no_console_kwargs: dict) -> bool:
+    """Commit exactly the moved sources and their destinations via
+    `--pathspec-from-file` (no argv path list: the set can exceed the Windows
+    argv limit), so the staged renames never linger in the shared index."""
+    root = Path(repo_root).resolve()
+    rels: list[str] = []
+    for src in srcs:
+        s = Path(src).resolve()
+        rels.append(s.relative_to(root).as_posix())
+        rels.append((Path(dst_dir).resolve() / s.name).relative_to(root).as_posix())
+    from coordinator_core.temp_layout import managed_tempdir
+    fd, pathspec_file = tempfile.mkstemp(
+        prefix="age-sweep-pathspec-", suffix=".txt", dir=managed_tempdir(root)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(rels) + "\n")
+        result = subprocess.run(
+            ["git", "commit", "-q", "-m", f"age-sweep: archive {len(srcs)} aged universal lesson(s)",
+             f"--pathspec-from-file={pathspec_file}"],
+            capture_output=True,
+            cwd=str(root),
+            **no_console_kwargs,
+        )
+    finally:
+        try:
+            os.remove(pathspec_file)
+        except OSError:
+            pass
+    if result.returncode != 0:
+        err = result.stderr.decode("utf-8", errors="replace").strip()
+        print(f"  error: git commit of {len(srcs)} moved entries failed "
+              f"(renames left staged): {err}", file=sys.stderr)
+        return False
+    return True
+
+
+_GIT_MV_BATCH_BUDGET = 20000
+
+
+def _batched_git_mv_into_dir(
+    srcs: list, dst_dir, repo_root, no_console_kwargs: dict
+) -> int | None:
+    """`git mv` every `srcs` entry into `dst_dir` (same target for all, so
+    basenames are preserved) using as few spawns as the argv-length budget
+    allows: N -> ceil(N / batch) calls, never N -> N. Returns the count moved,
+    or None (having already printed the ERROR) on any batch failure -- a
+    batch failure aborts the sweep rather than guessing which entries in a
+    failed batch actually moved."""
+    if not srcs:
+        return 0
+    batches: list[list] = []
+    current: list = []
+    current_len = 0
+    for src in srcs:
+        entry_len = len(str(src)) + 1
+        if current and current_len + entry_len > _GIT_MV_BATCH_BUDGET:
+            batches.append(current)
+            current = []
+            current_len = 0
+        current.append(src)
+        current_len += entry_len
+    if current:
+        batches.append(current)
+
+    moved = 0
+    for batch in batches:
+        result = subprocess.run(
+            ["git", "mv", *[str(s) for s in batch], str(dst_dir)],
+            capture_output=True,
+            cwd=str(repo_root),
+            **no_console_kwargs,
+        )
+        if result.returncode != 0:
+            err = result.stderr.decode("utf-8", errors="replace").strip()
+            print(f"  error: git mv failed for a {len(batch)}-entry batch: {err}", file=sys.stderr)
+            return None
+        moved += len(batch)
+    return moved
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

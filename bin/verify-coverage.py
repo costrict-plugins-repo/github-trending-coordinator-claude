@@ -1,0 +1,93 @@
+#
+# verify-coverage — CLI trampoline over claude-klabauter coordinator_core.ops.verify_coverage.
+#
+# Cross-reference integrity sweep for the coordinator-claude plugin tree: every
+# `<plugin>:<name>` skill/agent/command reference, `subagent_type:` assignment,
+# and worker bullet under a "## Worker Dispatch Recommendations" header must
+# resolve to a real artifact on disk. Invoked from /update-docs Phase 11h2.
+#
+# Usage:
+#   verify-coverage [--root <path>] [--sweep-root <path>] [--json] [--report-only]
+#
+# Options:
+#   --root <path>        Plugin tree root (artifact discovery). Defaults to
+#                         the resolved content root, else the OSS
+#                         mirror ~/.claude/plugins/coordinator-claude/.
+#   --sweep-root <path>  Doc-sweep root (which .md files get scanned). Defaults
+#                         to the invoking repo's cwd — deliberately NOT the
+#                         plugin root, so a consumer repo's coverage pass never
+#                         HALTs on coordinator-content-repo's own archival drift.
+#   --json                Emit machine-readable JSON instead of a markdown report.
+#   --report-only         Always exit 0 even when violations exist.
+#
+# Exit codes (HARDENED per the 2026-07-17 porter-brief addendum A3/A3b — mirrors
+# the sibling refresh-queries.py trampoline's dedicated-code precedent):
+#   0 — clean (or --report-only)
+#   1 — orphan reference(s) found (business fail, from the ported module)
+#   2 — usage/configuration error (unknown flag, root/sweep-root not found —
+#       also from the ported module's own main())
+#   3 — TRANSPORT failure: engine-root resolution or
+#       coordinator_core.ops.verify_coverage import failure AT THIS trampoline
+#       layer. Deliberately distinct from both CLI-usage (2) and business (1)
+#       failure — a caller branching on exit code alone (e.g. /update-docs
+#       Phase 11h2) must be able to tell "the claude-klabauter engine couldn't be
+#       located" apart from "your flag/root was wrong" without parsing
+#       stderr text. Phase 11h2 itself only checks nonzero (no per-code
+#       branching found), so this change is exit-code-additive, not
+#       contract-breaking for known callers.
+#
+# Shebang note: the SHEBANG line above is `#!/usr/bin/env python3`, and correct
+# for this shape. On Windows, this file's co-located `.cmd` twin wins via
+# `PATHEXT` when invoked as a bareword, so the shebang is never read there; on
+# macOS/Linux `python3` is the right interpreter. Caution: callers must invoke
+# via the extensionless name or a resolved-interpreter prefix, never a bareword
+# `.py` through git-bash — git-bash DOES honor the shebang and would exec-127
+# with no `python3` present. See the carve-out in coordinator-content-repo's
+# coordinator/docs/wiki/bash-on-windows-gotchas.md § Carve-out (cross-repo —
+# this wiki lives in the coordinator-content-repo repo, not here).
+#
+# Port of: coordinator/bin/verify-coverage.js (retired on cutover; see git log)
+# Spec backlink: tasks/2026-07-16-clean-slate-recon (BIG_PORT Wave B, item verify-coverage)
+
+from __future__ import annotations
+
+import os
+import sys
+
+def _import_runner():
+    import lib  # noqa: F401 — bootstraps coordinator/bin/lib onto sys.path
+    from cc_invoke import require_dispatch_engine_on_path
+
+    claude_klabauter_root = require_dispatch_engine_on_path()
+    from coordinator_core.cli_entry import run_op_main
+
+    return run_op_main
+
+
+def main(argv: "list[str] | None" = None) -> int:
+    try:
+        run_op_main = _import_runner()
+    except RuntimeError as exc:
+        print(f"verify-coverage: engine-root resolution failed: {exc}", file=sys.stderr)
+        return 3
+    except ImportError as exc:
+        print(
+            f"verify-coverage: coordinator_core.cli_entry not importable: {exc}",
+            file=sys.stderr,
+        )
+        return 3
+
+    try:
+        code = run_op_main("coordinator_core.ops.verify_coverage", (sys.argv[1:] if argv is None else argv))
+    except ImportError as exc:
+        print(
+            f"verify-coverage: coordinator_core.ops.verify_coverage not importable: {exc}",
+            file=sys.stderr,
+        )
+        return 3
+
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

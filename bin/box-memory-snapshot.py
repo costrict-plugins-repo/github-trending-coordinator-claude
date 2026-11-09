@@ -1,0 +1,332 @@
+"""box-memory-snapshot.py [--top N] [--admit-peak GIB] -- one-screen box memory snapshot (Windows and macOS).
+
+On macOS available is the kernel figure, commit limit is physical + swap capacity, nonpaged pool
+and cache fields print `unavailable`, and top consumers rank by `ri_phys_footprint` (resident +
+compressed + swapped), which can far exceed `ps` RSS. Prints Available, commit used vs limit, system cache working set, standby, nonpaged pool and the
+top N consumers by private commit. A counter that fails to read prints `unavailable` for that
+field alone. `--admit-peak GIB` adds one line, `ADMIT ...` (exit 0) or `HOLD ...` naming the
+failed clause (exit 4); the figure is net of `reserved=`, the sum over live START pids without an
+END in admission.jsonl of max(0, declared_peak_mb - tree RSS). Need is peak + min(0.25*peak, 8 GiB);
+`--fleet` drops the cushion (need is peak) for a fleet already sized with its reserve S.
+`--command-key K` with `--record-peak GIB` keeps K's largest seen peak (used when `--admit-peak` is omitted, except on a record or release call);
+`--register-pid P` on ADMIT reserves P's headroom, `--release-pid P` frees it. `--reservation` prints
+each registered running job's headroom and the total in GiB (an exited job is absent: it adds 0). `--json` emits the same
+fields. Other hosts: exit 6.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import importlib.util
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Callable, Optional
+
+PROG = "box-memory-snapshot"
+_LIB = Path(__file__).resolve().parent / "lib"
+_UNAVAILABLE = "unavailable"
+_READ_FIELDS = ("available_gib", "commit_used_gib", "system_cache_ws_gib", "nonpaged_pool_gib", "top_consumers")
+_FAILED_READ_NOTE = (
+    "a failed read is not evidence of a kernel leak; memory reads fail under commit exhaustion. "
+    "Read process_counts: a runaway python/conhost count is the leading signal."
+)
+
+
+def _load(name: str):
+    spec = importlib.util.spec_from_file_location(name, _LIB / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module  # the host's @dataclass classes resolve annotations through it
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_cache_host():
+    """Instantiate the promoted Win32FileCacheHost; its sibling import needs lib on sys.path."""
+    if str(_LIB) not in sys.path:
+        sys.path.insert(0, str(_LIB))
+    import file_cache_win32
+
+    return file_cache_win32.Win32FileCacheHost()
+
+
+def _gib(value: int) -> float:
+    return round(value / 1024**3, 2)
+
+
+def _try(fn: Callable):
+    try:
+        return fn()
+    except Exception:
+        return None
+
+
+def _top_consumers_gov(gov, top: int) -> list:
+    foot = gov.footprints()
+    cmds = {p.pid: p.cmd for p in gov.list_procs()}
+    ranked = sorted(foot.items(), key=lambda kv: kv[1], reverse=True)[:top]
+    return [
+        {"pid": pid, "private_commit_mb": round(mb, 1), "cmd": cmds.get(pid, "")[:100]}
+        for pid, mb in ranked
+    ]
+
+
+def _top_consumers_table(proc_table_fn: Callable, cmdline_fn: Callable, top: int) -> list:
+    """Rank the one process-table read by private bytes; read a cmdline for the top N rows only."""
+    ranked = sorted(proc_table_fn(), key=lambda r: r.private_bytes, reverse=True)[: max(top, 0)]
+    return [
+        {
+            "pid": r.pid,
+            "private_commit_mb": round(r.private_bytes / 1024**2, 1),
+            "cmd": (cmdline_fn(r.pid) or "")[:100],
+        }
+        for r in ranked
+    ]
+
+
+_COUNTED = ("python", "conhost")
+
+
+def _psutil_image_names() -> list:
+    import psutil
+
+    return [p.info["name"] or "" for p in psutil.process_iter(["name"])]
+
+
+def _image_stem(name: str) -> str:
+    low = name.lower()
+    low = low[:-4] if low.endswith(".exe") else low
+    return "python" if low.startswith("python") else low
+
+
+def _process_counts(table_fn: Optional[Callable], names_fn: Callable) -> Optional[dict]:
+    """Per-image counts (python, conhost): the process table first, then psutil; None if both fail.
+
+    In-process reads only: a spawn is the read most likely to fail under commit exhaustion.
+    """
+    names = None
+    if table_fn is not None:
+        rows = _try(table_fn)
+        if rows is not None:
+            names = [getattr(r, "image", "") or "" for r in rows]
+            if not any(names):  # a table without image names is no count
+                names = None
+    if names is None:
+        names = _try(names_fn)
+    if names is None:
+        return None
+    stems = [_image_stem(n) for n in names]
+    return {k: stems.count(k) for k in _COUNTED}
+
+
+def build_snapshot(
+    status, nonpaged_fn, cache_host_fn, consumers_fn: Callable, top: int, counts_fn: Optional[Callable] = None
+) -> dict:
+    cache = _try(lambda: cache_host_fn().read_memory())
+    nonpaged = _try(nonpaged_fn)
+    consumers = _try(lambda: consumers_fn(top))
+    counts = _try(counts_fn) if counts_fn else None
+    snap = {
+        "available_gib": _gib(status.avail_phys) if status else _UNAVAILABLE,
+        "commit_used_gib": _gib(status.commit_used) if status else _UNAVAILABLE,
+        "commit_limit_gib": _gib(status.commit_limit) if status else _UNAVAILABLE,
+        "system_cache_ws_gib": _gib(cache.cache_bytes) if cache else _UNAVAILABLE,
+        "standby_gib": _gib(cache.standby_bytes) if cache else _UNAVAILABLE,
+        "nonpaged_pool_gib": _gib(nonpaged) if nonpaged is not None else _UNAVAILABLE,
+        "top_consumers": consumers if consumers is not None else _UNAVAILABLE,
+        "process_counts": counts if counts is not None else _UNAVAILABLE,
+    }
+    failed = [k for k in _READ_FIELDS if snap[k] == _UNAVAILABLE]
+    if failed:
+        snap["note"] = _FAILED_READ_NOTE
+    return snap
+
+
+def _render(snap: dict) -> str:
+    lines = [
+        f"Available:        {snap['available_gib']} GiB",
+        f"Commit:           {snap['commit_used_gib']} / {snap['commit_limit_gib']} GiB",
+        f"System cache WS:  {snap['system_cache_ws_gib']} GiB",
+        f"Standby:          {snap['standby_gib']} GiB",
+        f"Nonpaged pool:    {snap['nonpaged_pool_gib']} GiB",
+    ]
+    pc = snap["process_counts"]
+    if pc == _UNAVAILABLE:
+        lines.append(f"Process counts:   {_UNAVAILABLE}")
+    else:
+        lines.append("Process counts:   " + "  ".join(f"{k}={v}" for k, v in pc.items()))
+    if "note" in snap:
+        lines.append(f"Note:             {snap['note']}")
+    top = snap["top_consumers"]
+    if top == _UNAVAILABLE:
+        lines.append(f"Top consumers:    {_UNAVAILABLE}")
+    else:
+        lines.append("Top consumers by private commit:")
+        for row in top:
+            lines.append(f"  {row['pid']:>7}  {row['private_commit_mb']:>9.1f} MB  {row['cmd']}")
+    return "\n".join(lines)
+
+
+def _render_reservation(res: dict) -> str:
+    lines = ["Reservation (GO-admitted running jobs, max(0, declared peak - tree RSS)):"]
+    for j in res["jobs"]:
+        lines.append(f"  {'grant' if j['pid'] is None else j['pid']:>7}  {j['reserved_gib']:>7.2f} GiB  {j['run']}")
+    lines.append(f"Reservation total: {res['total_gib']} GiB")
+    return "\n".join(lines)
+
+
+def _admit_line(verdict, peak_gib: float, status, limit: int) -> str:
+    if verdict.admit:
+        return f"ADMIT peak={peak_gib}GiB need_avail={_gib(int(verdict.need_avail))}GiB"
+    failed = []
+    if not verdict.avail_ok:
+        failed.append(
+            f"available: need {_gib(int(verdict.need_avail))}GiB > avail {_gib(status.avail_phys)}GiB"
+        )
+    if not verdict.commit_ok:
+        failed.append(
+            f"commit: used {_gib(status.commit_used)}GiB + peak {peak_gib}GiB > limit {_gib(limit)}GiB"
+        )
+    return f"HOLD peak={peak_gib}GiB failed {'; '.join(failed)}"
+
+
+def main(
+    argv: Optional[list] = None,
+    *,
+    platform: Optional[str] = None,
+    status_fn: Optional[Callable] = None,
+    nonpaged_fn: Optional[Callable] = None,
+    cache_host_fn: Optional[Callable] = None,
+    governor=None,
+    rss_fn: Optional[Callable] = None,
+    alive_fn: Optional[Callable] = None,
+    create_time_fn: Optional[Callable] = None,
+    image_fn: Optional[Callable] = None,
+    proc_table_fn: Optional[Callable] = None,
+    cmdline_fn: Optional[Callable] = None,
+    names_fn: Optional[Callable] = None,
+) -> int:
+    parser = argparse.ArgumentParser(prog=PROG, description="One-screen box memory snapshot.")
+    parser.add_argument("--top", type=int, default=10, help="top N consumers (default 10)")
+    parser.add_argument("--admit-peak", type=float, metavar="GIB", help="check admission of a peak; the default "
+                        "mode fits a single heavy job and adds a cushion of min(--cushion-pct of peak, 8 GiB)")
+    parser.add_argument("--fleet", action="store_true", help="admit with no cushion: available >= peak and "
+                        "commit + peak <= limit only. For a fleet already sized with its reserve S")
+    parser.add_argument("--cushion-pct", type=float, default=25.0, help="available cushion percent")
+    parser.add_argument("--commit-limit-gib", type=float, help="override the commit limit")
+    parser.add_argument("--admission-file", help="admission.jsonl path (default: settings-home channel)")
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument("--command-key", help="name of the command; keys its recorded peak")
+    parser.add_argument("--record-peak", type=float, metavar="GIB", help="record this command's seen peak (max kept)")
+    parser.add_argument("--register-pid", type=int, help="on ADMIT, reserve this pid's headroom until release or exit")
+    parser.add_argument("--release-pid", type=int, help="free the reservation registered for this pid")
+    parser.add_argument("--reservation", action="store_true", help="print each GO-admitted running job's "
+                        "max(0, declared peak - tree RSS) and their total in GiB; exited jobs add 0")
+    args = parser.parse_args(argv)
+    if args.fleet:  # a fleet's width formula already took its reserve S out; a cushion pads it twice
+        args.cushion_pct = 0.0
+
+    host = _load("box_memory_host")
+    adm_path = args.admission_file or host.admission_file()
+    if args.command_key and args.release_pid is not None:
+        host.release_command(adm_path, args.command_key, args.release_pid)
+    if args.command_key and args.record_peak is not None:
+        host.record_peak(adm_path, args.command_key, args.record_peak)
+    if args.admit_peak is None and args.command_key and args.record_peak is None and args.release_pid is None:
+        args.admit_peak = host.read_recorded_peak(adm_path, args.command_key)
+    plat = platform if platform is not None else sys.platform
+    if plat not in ("win32", "darwin"):
+        return host.unsupported(PROG, plat, "reads Windows or macOS memory counters")
+    if governor is None and proc_table_fn is None and names_fn is None:
+        missing = host.require_psutil(PROG)
+        if missing is not None:
+            return missing
+
+    status_fn = status_fn or host.read_memory_status
+    if plat == "darwin":
+        # No nonpaged pool or file-cache counters on macOS: those fields print `unavailable`.
+        nonpaged_fn = nonpaged_fn or (lambda: None)
+        cache_host_fn = cache_host_fn or (lambda: SimpleNamespace(read_memory=lambda: None))
+    else:
+        nonpaged_fn = nonpaged_fn or host.nonpaged_pool_bytes
+        cache_host_fn = cache_host_fn or _load_cache_host
+    table_fn = None
+    if plat == "win32":
+        table_fn = proc_table_fn or host.proc_table
+        cmd_fn = cmdline_fn or host.proc_cmdline
+        consumers_fn = lambda top: _top_consumers_table(table_fn, cmd_fn, top)
+    else:
+        gov_fn = (lambda: governor) if governor is not None else host.load_governor
+        consumers_fn = lambda top: _top_consumers_gov(gov_fn(), top)
+
+    status = _try(status_fn)
+    counts_fn = lambda: _process_counts(table_fn, names_fn or _psutil_image_names)
+    snap = build_snapshot(status, nonpaged_fn, cache_host_fn, consumers_fn, args.top, counts_fn)
+    code = 0
+    admit_line = None
+    reserved_kw = {
+        **({"rss_fn": rss_fn} if rss_fn else {}),
+        **({"alive_fn": alive_fn} if alive_fn else {}),
+        **({"create_time_fn": create_time_fn} if create_time_fn else {}),
+        **({"image_fn": image_fn} if image_fn else {}),
+    }
+    if args.reservation:
+        jobs = host.top_holders(adm_path, limit=sys.maxsize, **reserved_kw)
+        snap["reservation"] = {
+            "jobs": [
+                {"session_id": j["session_id"], "run": j["run"], "pid": j["pid"], "reserved_gib": _gib(j["bytes"])}
+                for j in jobs
+            ],
+            "total_gib": _gib(sum(j["bytes"] for j in jobs)),
+        }
+    if args.admit_peak is not None:
+        if status is None:
+            print(f"{PROG}: cannot read memory status for admission", file=sys.stderr)
+            return 1
+        peak = int(args.admit_peak * host.GIB)
+        limit = int(args.commit_limit_gib * host.GIB) if args.commit_limit_gib is not None else status.commit_limit
+        if args.command_key and args.register_pid is not None:
+            verdict, reserved = host.admit_and_register(
+                adm_path, args.command_key, args.register_pid, args.admit_peak, status,
+                cushion_pct=args.cushion_pct, commit_limit=limit, **reserved_kw,
+            )
+        else:
+            reserved = host.reserved_bytes(adm_path, **reserved_kw)
+            adjusted = dataclasses.replace(
+                status,
+                avail_phys=max(0, status.avail_phys - reserved),
+                commit_used=status.commit_used + reserved,
+            )
+            verdict = host.admit(peak, adjusted, cushion_pct=args.cushion_pct, commit_limit=limit)
+        # Display only: the verdict above already netted `reserved`.
+        status = dataclasses.replace(
+            status,
+            avail_phys=max(0, status.avail_phys - reserved),
+            commit_used=status.commit_used + reserved,
+        )
+        admit_line = _admit_line(verdict, args.admit_peak, status, limit) + f" reserved={_gib(reserved)}GiB"
+        snap["admit"] = {
+            "reserved_gib": _gib(reserved),
+            "verdict": "ADMIT" if verdict.admit else "HOLD",
+            "peak_gib": args.admit_peak,
+            "need_avail_gib": _gib(int(verdict.need_avail)),
+            "avail_ok": verdict.avail_ok,
+            "commit_ok": verdict.commit_ok,
+        }
+        code = 0 if verdict.admit else 4
+
+    if args.json:
+        print(json.dumps(snap))
+    else:
+        print(_render(snap))
+        if "reservation" in snap:
+            print(_render_reservation(snap["reservation"]))
+        if admit_line:
+            print(admit_line)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

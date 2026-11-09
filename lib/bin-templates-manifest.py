@@ -1,0 +1,104 @@
+"""
+bin-templates-manifest.py — single source of truth for which of DoE's
+`coordinator/templates/bin/` artifacts claude-klabauter's installer classifies as
+`code` vs `operator-config`, and how it installs each one.
+
+Imported (never executed) by:
+  - coordinator_core.install.substrate._load_bin_templates_manifest
+    (spec_from_file_location load — the hyphenated filename precludes a
+    normal `import` statement, same reason setup-templates-manifest.py is
+    loaded that way)
+
+`ml_bin` (`coordinator_core/install/substrate.py`'s `plugin_root / "templates"
+/ "bin"`) resolves to DoE's tree — every artifact this manifest names is
+authored and owned by DoE; claude-klabauter only classifies and copies it. That
+classification used to live in four hand-maintained tuples
+(`_ML_FAMILY_FILES` / `_CH_FAMILY_FILES` / `_ML_EXPLICIT_FILES` /
+`_PLATFORM_LOCALIZE_FILES`) hardcoded against a directory claude-klabauter does not
+own, which is exactly how `coordinator-settings-home` (stale since Jul 6)
+and `claude-machine-local.ps1` (stale since Jul 22) drifted silently. This
+manifest is the fix: ONE declared, tested table, edited HERE and nowhere
+else — the parity test
+`coordinator/tests/install/test_bin_templates_manifest_sync.py` fails the
+build if `templates/bin/` gains a file this manifest does not classify, or
+if an entry here no longer exists on disk.
+
+Spec backlink: pln-install-surface-freshness-exte-f702c8
+               § C12 / AC19 / AC20
+
+Every entry's `artifact_class` is `"code"` and `force_overwrite` is `True` —
+per C1 (already landed), none of DoE's `templates/bin/` artifacts is
+operator-config; a stale destination is always repaired on re-install. C12
+does NOT re-decide this — it transcribes C1's landed decision verbatim.
+`exec_bit` is the POSIX permission bit `_install_one` applies at the
+destination (NOT a code/config classifier — see substrate.py's own
+`_install_one` docstring on why `.ps1` files are legitimately code with
+`exec_bit=False` by construction).
+
+Negative spec: do NOT add `_CH_FAMILY_FILES`'s three names here
+(`claude-home`, `_claude_home.py`, `claude-home.cmd`). Their source is
+`coordinator/lib/claude-home/` — CLAUDE-KLABAUTER'S OWN tree, not DoE's
+`templates/bin/` — so they are out of this manifest's scope by
+construction; `_CH_FAMILY_FILES` stays a separate, hand-maintained tuple in
+substrate.py. Likewise `_RM_FAMILY_FILES` (`_resolve_claude_klabauter.py`, sourced
+from `coordinator/lib/resolve-claude-klabauter/`) is out of scope for the same
+reason. Folding either in would make this manifest's own parity test lie —
+it walks DoE's `templates/bin/` directory, and neither family's source
+lives there.
+"""
+
+from __future__ import annotations
+
+from typing import NamedTuple
+
+
+class BinTemplateEntry(NamedTuple):
+
+    name: str
+    artifact_class: str
+    exec_bit: bool
+    force_overwrite: bool
+
+
+# --- ml_family (substrate.py's former _ML_FAMILY_FILES, transcribed verbatim) ---
+ML_FAMILY_FILES: "tuple[BinTemplateEntry, ...]" = (
+    BinTemplateEntry("machine-local", "code", True, True),
+    BinTemplateEntry("_machine_local.py", "code", False, True),
+    BinTemplateEntry("machine-local.cmd", "code", False, True),
+    BinTemplateEntry("resolve-coordinator-clone", "code", True, True),
+    BinTemplateEntry("resolve-coordinator-clone.cmd", "code", False, True),
+)
+
+# --- ml_explicit (former _ML_EXPLICIT_FILES, transcribed verbatim) ---
+ML_EXPLICIT_FILES: "tuple[BinTemplateEntry, ...]" = (
+    BinTemplateEntry("coordinator-settings-home", "code", True, True),
+    BinTemplateEntry("coordinator-settings-home.cmd", "code", False, True),
+    BinTemplateEntry("coordinator-settings-home.ps1", "code", False, True),
+    BinTemplateEntry("claude_machine_local.py", "code", False, True),
+    BinTemplateEntry("claude-machine-local.sh", "code", False, True),
+    BinTemplateEntry("claude-machine-local.ps1", "code", False, True),
+)
+
+# --- platform_localize (former _PLATFORM_LOCALIZE_FILES, transcribed verbatim) ---
+PLATFORM_LOCALIZE_FILES: "tuple[BinTemplateEntry, ...]" = (
+    BinTemplateEntry("platform-localize.py", "code", True, True),
+    BinTemplateEntry("platform-localize.cmd", "code", False, True),
+)
+
+GIT_BASH_FAST_PROFILE_FILES: "tuple[BinTemplateEntry, ...]" = (
+    BinTemplateEntry("install-git-bash-fast-profile.py", "code", True, True),
+    BinTemplateEntry("git-bash-fast-profile.sh", "code", False, True),
+)
+
+LAUNCHER_TEMPLATE_FILES: "tuple[BinTemplateEntry, ...]" = (
+    BinTemplateEntry("claude-author-launcher.cmd.tmpl", "code", False, True),
+    BinTemplateEntry("claude-author-launcher.ps1.tmpl", "code", False, True),
+)
+
+ALL_BIN_TEMPLATE_FILES: "tuple[BinTemplateEntry, ...]" = (
+    ML_FAMILY_FILES
+    + ML_EXPLICIT_FILES
+    + PLATFORM_LOCALIZE_FILES
+    + GIT_BASH_FAST_PROFILE_FILES
+    + LAUNCHER_TEMPLATE_FILES
+)

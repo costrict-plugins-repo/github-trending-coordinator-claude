@@ -1,0 +1,355 @@
+"""Auto-fire hook for the wide run's run-id minting (naked Python, no bash)
+-- the mise-side twin of `pickup-autofire.py`. Fires on either entry path a
+mise-en-place-shaped invocation reaches this hook by: a typed
+`UserPromptExpansion` (today's `/mise-en-place` slash command) or a
+model-invoked `PreToolUse` call on the `Skill` tool naming the same verb --
+see `_skill_invocation.py`, this module's shared payload adapter.
+
+Purpose: when the EM types `/mise-en-place` (see `_MISE_COMMAND_NAMES`), this hook fires
+ahead of `UserPromptSubmit`, mints a
+fresh Phase-0 run id via the engine plane's `backlog-grind-assemble
+mint-run-id mise-en-place` CLI, immediately briefs that same id back through
+`backlog-grind-assemble brief mise-en-place --run-id <minted>`, and injects
+both the minted id (plus the inventory path it implies, and the brief's
+decision object) as `additionalContext` -- so the EM's own turn already has
+an engine-issued run id in hand rather than inventing one by convention.
+
+Both calls are READ-ONLY. Unlike `pickup-autofire.py`'s twin surface (which
+auto-fires a mutating `apply` half on a clear coast), this hook has NO
+mutating half and must never grow one: `mint-run-id` and `brief` are the
+entire surface it touches. Phase 6 (the mutating cadence-close step) stays
+an EM-driven invocation quoting the minted id, exactly as before this hook
+existed -- see the cross-repo memo cited below for the boundary this was
+built against.
+
+Co-fires with `pickup-autofire.py`, by design and without conflict: that
+hook's `_BATON_GRAB_COMMAND_NAMES` matches the same verbs, because batons
+handed to the wide run are a grab too (`skills/pickup/SKILL.md` §
+Multi-Artifact Grab). It briefs the baton paths carried in `command_args`;
+this one mints the run id the cadence itself needs. Two `additionalContext`
+blocks on one prompt is the expected shape, not a double-fire bug -- neither
+hook reads or writes what the other computes.
+
+Contract (mirrors `pickup-autofire.py`):
+  stdin   -- either a `UserPromptExpansion` payload (command_name,
+             command_args, command_source, cwd, expansion_type, session_id,
+             prompt_id, ...) or a `PreToolUse` payload with
+             `tool_name == "Skill"`; `_skill_invocation.read_invocation`
+             adapts both to one shape.
+  stdout  -- one `hookSpecificOutput` JSON envelope with `additionalContext`,
+             `hookEventName` set to whichever event fired, when a
+             mise-en-place verb was matched and a mint+brief pair could be
+             computed; NOTHING otherwise (silent pass -- an unrelated
+             command, an unrecognized payload, or a total transport
+             failure, produces no output)
+  exit 0  -- always. This hook is advisory only and never blocks the EM's
+             own prompt.
+
+Cross-repo provenance: the engine plane's commit `339470fd6bd7` shipped
+`mint-run-id <cadence>` as a sibling subcommand to `brief`/`apply` on the
+same `backlog-grind-assemble` trampoline; the consumer contract this hook
+relies on is pinned in
+`cross-repo/inbox/2026-08-04-claude-klabauter-em-mint-run-id-verb-shipped.md`:
+
+  - `inventory_path` is repo-relative POSIX on every platform, never
+    machine-absolute -- it is the path the id IMPLIES, not a path that
+    exists yet.
+  - The verb is read-only and specifically never creates
+    `state/mise-inventory/`. That directory's ABSENCE is the engine's own
+    Phase-0-vs-Phase-6 self-gate; this hook must not create it either, not
+    as a side effect, not "helpfully" -- there is no filesystem-touching
+    code anywhere in this module.
+  - A cadence no reader claims is a usage error (exit 2) -- only
+    `mise-en-place` claims it today, and `_CADENCE` is that literal on every
+    invocation verb this hook matches, so that failure mode is never actually
+    reachable from here; it still degrades to silent pass per this module's
+    fail-open discipline rather than assuming the exit code.
+  - A minted id is by construction accepted by the very next
+    `brief mise-en-place --run-id <minted>` -- confirmed live at authoring
+    time; the brief call is not expected to reject its own freshly-minted
+    input, but its failure still degrades to silent pass like every other
+    step.
+
+Safety envelope, each clause load-bearing:
+  (a) NEVER fires a mutating call. There is no `apply`-equivalent anywhere
+      in this module; `mint-run-id` and `brief` are both read-only per the
+      memo above, and that is the whole surface this hook touches.
+  (b) Hook errors / timeouts / transport failures degrade to silent pass and
+      NEVER block the run's prompt -- every subprocess call and every JSON
+      decode in this module is wrapped to fail open, and `main()` never
+      raises. A failed mint means the EM mints by hand, exactly today's
+      behaviour.
+  (c) `additionalContext` never exceeds `_CONTEXT_BUDGET_CHARS` (10,000).
+      Over budget, the rendered text is hard-truncated as a last resort --
+      this hook's payload is small and fixed-shape (an id, a path, one
+      decision object), so no priority-ladder degrade is needed the way
+      `pickup-autofire.py`'s N-baton render requires.
+  (d) `async: false` semantics: the minted id and briefed decision must land
+      in the SAME turn the EM's prompt is being expanded into -- an async
+      fire would compute the mint after the EM has already acted on the
+      prompt, which defeats the purpose entirely.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+# The bare verbs this hook reacts to. Deliberately the SAME literal set
+# `pickup-autofire.py` uses for its own `_BATON_GRAB_COMMAND_NAMES` -- not a
+# second, independently-chosen convention for what counts as an invocation of
+# the wide run. `fire-and-forget` is a separate ceremony and must not mint.
+_MISE_COMMAND_NAMES = frozenset({"mise-en-place"})
+
+# The one cadence `mint-run-id`/`brief` are called with from this hook. It is
+# ENGINE vocabulary, not an invocation verb: the sentinel mode, the run-id
+# family and `handoff.schema.json`'s cadence key all spell it `mise-en-place`,
+# and none of them move when a new verb is admitted above. Widening
+# `_MISE_COMMAND_NAMES` never widens this.
+_CADENCE = "mise-en-place"
+
+_CONTEXT_BUDGET_CHARS = 10_000
+
+_MINT_TIMEOUT_SECONDS = 12
+_BRIEF_TIMEOUT_SECONDS = 12
+
+# Windows console-subprocess discipline: `python.exe` is a CONSOLE-subsystem
+# child. `getattr` resolves to 0 (no-op) on every non-Windows platform.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+# --- COORDINATOR_SETTINGS_HOME resolution (mirrors pickup-autofire.py) ------
+
+
+def resolve_settings_home() -> Path:
+    """Resolve the coordinator-claude settings-home root.
+
+    Precedence: an explicit `COORDINATOR_SETTINGS_HOME` override is used
+    AS-IS; otherwise `CLAUDE_HOME` (or `HOME`) joined with the fixed
+    `.coordinator-claude-settings` suffix. Bit-for-bit the same precedence
+    as `pickup-autofire.py::resolve_settings_home` -- kept as an independent
+    copy (not a shared import) because hook scripts in this directory are
+    each self-contained single-file modules loaded by path, not package
+    members with a shared internal import surface.
+    """
+    override = os.environ.get("COORDINATOR_SETTINGS_HOME")
+    if override:
+        return Path(override)
+    base = os.environ.get("CLAUDE_HOME") or str(Path.home())
+    return Path(base) / ".coordinator-claude-settings"
+
+
+_HOOKS_DIR = str(Path(__file__).resolve().parent)
+if _HOOKS_DIR not in sys.path:
+    sys.path.insert(0, _HOOKS_DIR)
+try:
+    from _forwarder_resolve import forwarder_argv as _forwarder_argv
+    from _forwarder_resolve import resolve_forwarder as _resolve_forwarder
+except Exception:
+    def _resolve_forwarder(bin_dir, name):  # type: ignore[misc]
+        candidate = bin_dir / name
+        return candidate if candidate.is_file() else None
+
+    def _forwarder_argv(script_path, tail=()):  # type: ignore[misc]
+        raise OSError("forwarder resolution unavailable -- import fallback declined to guess a launch decision")
+
+# Every consumer of _skill_invocation lives in this same directory, so a
+# deploy missing it is a deploy error to surface, not a shape to degrade past.
+from _skill_invocation import context_envelope as _context_envelope
+from _skill_invocation import read_invocation as _read_invocation
+
+
+def resolve_backlog_grind_assemble_bin(settings_home: Path) -> Path | None:
+    """Returns the extensionless script or the native `.exe`, whichever the
+    install carries, or None when neither is found -- the caller treats None
+    as a transport failure and fails open. Does not resolve
+    `bin/backlog-grind-assemble.cmd` (CreateProcess cannot launch one)."""
+    return _resolve_forwarder(settings_home / "bin", "backlog-grind-assemble")
+
+
+def backlog_grind_assemble_argv(script_path: Path, tail: list[str]) -> list[str]:
+    """Interpreter prefix is decided by which variant resolved, not
+    assumed: an extensionless script requires it, a native `.exe` must be
+    launched bare."""
+    return _forwarder_argv(script_path, tail)
+
+
+class _TransportFailure(Exception):
+    """Raised when a `backlog-grind-assemble` invocation could not be
+    completed at all (binary unresolvable, spawn failure, timeout) --
+    as opposed to the target CLI running and returning a non-zero business
+    exit code, which is not a transport failure. This hook treats both the
+    same way (silent pass)."""
+
+
+def _run_backlog_grind_assemble(
+    script_path: Path, tail: list[str], timeout: float
+) -> subprocess.CompletedProcess:
+    # Never lets a raw OSError/TimeoutExpired escape -- every caller must be
+    # able to fail open.
+    try:
+        argv = backlog_grind_assemble_argv(script_path, tail)
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            creationflags=_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise _TransportFailure(str(exc)) from exc
+
+
+def decode_mint_payload(stdout: str) -> dict | None:
+    # Fail-open: None on any shape mismatch, never raises.
+    try:
+        obj = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    run_id = obj.get("run_id")
+    inventory_path = obj.get("inventory_path")
+    if not (isinstance(run_id, str) and run_id):
+        return None
+    if not (isinstance(inventory_path, str) and inventory_path):
+        return None
+    return {"run_id": run_id, "inventory_path": inventory_path}
+
+
+def decode_brief_payload(stdout: str) -> dict | None:
+    try:
+        obj = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def render_additional_context(run_id: str, inventory_path: str, brief: dict) -> str:
+    """Render the `additionalContext` string: the engine-minted run id and
+    the inventory path it implies (labelled as engine-issued, not
+    EM-guessed), followed by the brief's own `narration`/`next_move` prose
+    when present, then the full decision object as JSON evidence.
+
+    Hard-truncates at `_CONTEXT_BUDGET_CHARS` as a last resort -- this
+    payload is small and fixed-shape (unlike `pickup-autofire.py`'s N-baton
+    render, there is no priority ladder to degrade through here).
+    """
+    lines = [
+        f"Mise-en-place run id (engine-minted, not EM-guessed): {run_id}",
+        f"Inventory path this id implies (does not exist yet): {inventory_path}",
+    ]
+
+    narration = brief.get("narration")
+    if isinstance(narration, str) and narration:
+        lines.append(narration)
+
+    next_move = brief.get("next_move")
+    if isinstance(next_move, str) and next_move:
+        lines.append(f"Next move: {next_move}")
+
+    try:
+        lines.append("Brief decision object:\n" + json.dumps(brief, indent=2, sort_keys=True))
+    except (TypeError, ValueError):
+        pass
+
+    rendered = "\n\n".join(lines)
+    return rendered[:_CONTEXT_BUDGET_CHARS]
+
+
+def compute_context(stdin_text: str) -> str | None:
+    """Compute the bare `additionalContext` prose for a single invocation,
+    or `None` when nothing should be emitted (a non-matching verb, or any
+    fail-open step along the mint/brief chain).
+
+    Reads either entry path via `_skill_invocation.read_invocation` --
+    today's typed `UserPromptExpansion` payload, or a model-invoked
+    `PreToolUse(Skill)` call naming one of `_MISE_COMMAND_NAMES`. `main()`
+    wraps the return value with the `hookSpecificOutput` envelope on its own
+    typed path. No subagent guard: `mint-run-id` and `brief` are both
+    read-only engine-side, so a Skill-tool call from inside a dispatched
+    subagent mints and briefs exactly like the EM's own turn.
+    """
+    try:
+        payload = json.loads(stdin_text) if stdin_text else {}
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+
+    inv = _read_invocation(payload)
+    if inv is None:
+        return None
+    if inv.command_name not in _MISE_COMMAND_NAMES:
+        return None
+
+    settings_home = resolve_settings_home()
+    script_path = resolve_backlog_grind_assemble_bin(settings_home)
+    if script_path is None:
+        return None
+
+    try:
+        mint_result = _run_backlog_grind_assemble(
+            script_path, ["mint-run-id", _CADENCE], _MINT_TIMEOUT_SECONDS
+        )
+    except _TransportFailure:
+        return None
+
+    if mint_result.returncode != 0:
+        return None
+
+    minted = decode_mint_payload(mint_result.stdout)
+    if minted is None:
+        return None
+
+    run_id = minted["run_id"]
+    inventory_path = minted["inventory_path"]
+
+    try:
+        brief_result = _run_backlog_grind_assemble(
+            script_path,
+            ["brief", _CADENCE, "--run-id", run_id],
+            _BRIEF_TIMEOUT_SECONDS,
+        )
+    except _TransportFailure:
+        return None
+
+    if brief_result.returncode != 0:
+        return None
+
+    brief = decode_brief_payload(brief_result.stdout)
+    if brief is None:
+        return None
+
+    additional_context = render_additional_context(run_id, inventory_path, brief)
+    if not additional_context:
+        return None
+
+    return additional_context
+
+
+def main(stdin_text: str | None = None) -> int:
+    try:
+        raw = stdin_text if stdin_text is not None else sys.stdin.read()
+    except Exception:
+        return 0
+
+    additional_context = compute_context(raw)
+    if additional_context is None:
+        return 0
+
+    try:
+        print(_context_envelope("UserPromptExpansion", additional_context))
+    except OSError:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

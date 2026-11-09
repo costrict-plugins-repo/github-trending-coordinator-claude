@@ -1,0 +1,161 @@
+
+
+row_id_key: "@stem"
+
+batch_key: [severity]
+
+priority:
+  field: severity
+  order: asc
+
+verdicts:
+  - fix
+  - already-fixed
+  - file-removed
+  - plan-weight
+  - plan-substrate-collision
+  - park
+  - wont-do
+  - yagni
+  - unclear-direction
+  - needs-judgment
+
+
+hand_back_types:
+  - park
+  - wont-do
+  - yagni
+  - unclear-direction
+  - plan-substrate-collision
+
+graph:
+  triage:
+    kind: triage
+    edges:
+      fix: fix
+      already-fixed: refute-close
+      file-removed: refute-close
+      plan-weight: baton
+      needs-judgment: needs-judgment
+      plan-substrate-collision: plan-substrate-collision
+      park: park
+      wont-do: wont-do
+      yagni: yagni
+      unclear-direction: unclear-direction
+    on_fail: needs-judgment
+
+  refute-close:
+    kind: refute-close
+    edges:
+      confirmed: commit
+    
+    
+    on_fail: fix
+
+  fix:
+    kind: fix
+    edges:
+      done: verify
+    on_fail: needs-judgment
+
+  verify:
+    kind: verify
+    edges:
+      pass: commit
+    
+    
+    on_fail: verify-failed
+    verify:
+      default: agent
+
+  commit:
+    kind: commit
+    edges: {}
+    on_fail: commit-failed
+
+closure:
+  status_field: status
+  closed_values:
+    fix: closed
+    refute-close: closed
+  stamp_fields: [closed_at, closed_by]
+
+
+triage_policy: |
+  defer_requires_evidence:
+    - "already-fixed needs the failing case run against HEAD, tagged ran or inspected."
+    - "file-removed needs ls confirming absence."
+    - "plan-substrate-collision needs a named file collision with an actively-rewriting plan."
+
+  not_defer_reasons:
+    - "summary-form"
+    - "P2 or refactor flavour"
+    - "intersects an active plan, without a named file"
+    - "would take careful thought"
+
+  pattern_shifted_is_fix_signal:
+    - "A missing symbol at the cited line is usually the same bug with the symbol renamed or code reshuffled nearby, not a moved/resolved bug -- re-grep the recommended fix's central noun phrase before treating it as deferral-eligible. pattern-changed is not a verdict; the policy makes it a fix signal."
+
+  severity_classification:
+    - "crash, data loss, security or silent corruption -> P0."
+    - "wrong behaviour or a breaking flow -> P1."
+    - "otherwise -> P2."
+    - "A missing severity is a triage input, never a default."
+
+  depth_meaning:
+    - "P0 (deep): a careful read."
+    - "P1 (standard): a bulk verify."
+    - "P2 (shallow): a footprint declaration. The appetite knob picks the depth."
+
+  tf_rows_never_skip_triage:
+    - "TF-* rows arrive pre-tagged (crash-shape P0, else P1) but never skip triage -- there is no pre-declared footprint to skip to."
+
+  plan_weight_evidence:
+    - "≥3 files, a new module, a schema change, or new fixtures."
+    - "A t-shirt size needs evidence on every record."
+
+  baton_prechecks:
+    - "Not a phantom: the pattern is gone on HEAD."
+    - "Not mis-sized: ≤2 files and <50 lines is a fix, not a baton."
+
+  never_weaken_assertion:
+    - "Never weaken a test assertion to green without evidence it was wrong -- returns BLOCKED assertion-weakening-without-evidence."
+
+  fix_footprint_boundary:
+    - "The published engine mirror (the resolved engine root, claude-klabauter) and claude-klabauter are out of bounds for every fix agent, by any tool: Edit, Write, a Bash redirect, sed, or a python open(). A row whose fix lives there is engine-subject: do not widen scope to it and do not patch it. Report it as NEEDS_PLAN with the exact file, function, condition and suggested change so the EM can memo claude-klabauter."
+
+  tradeoff_marks_needs_judgment:
+    - "A record carrying a non-empty tradeoff statement goes to needs-judgment, regardless of size."
+
+
+appetite:
+  hunt:
+    where: [[["status", "==", "open"], ["severity", "==", "P0"]]]
+    concurrency: 2
+    extra_verification: true
+    batch_size: {default: 4}
+    triage_depth: deep
+    window: 1
+    max_agent_calls: 20
+
+  standard:
+    where: [[["status", "==", "open"], ["severity", "in", ["P0", "P1", "P2"]]]]
+    concurrency: 4
+    extra_verification: false
+    batch_size: {default: 4}
+    triage_depth: standard
+    window: 2
+    max_agent_calls: 40
+
+  sweep:
+    where: [[["status", "==", "open"]]]
+    concurrency: 16
+    extra_verification: true
+    batch_size: {P0: 2, P1: 6, P2: 10, P3: 12}
+    triage_depth: shallow
+    window: 4
+    max_agent_calls: 200
+
+archive_path: "archive/bug-backlog/"
+
+schema: bug-backlog.schema.json

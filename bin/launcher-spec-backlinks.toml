@@ -1,0 +1,27 @@
+
+
+# SSOT for the OPTIONAL `Spec backlink:` comment line that
+
+
+#     This repo's CLAUDE.md makes spec backlinks a REQUIRED exception to the
+
+
+#     ENFORCES that destruction. `bin/claude-klabauter-doctor-probe.cmd` lost exactly
+
+
+# WHY A REGISTRY AND NOT THE ENTRYPOINT'S OWN DOCSTRING
+
+
+#     since a launcher's backlink is a statement about the LAUNCHER's spec
+
+
+#     One `[backlinks]` table. Key: the entrypoint's REPO-RELATIVE POSIX path
+
+
+#     Keying on the ENTRYPOINT rather than on the launcher filename is what
+
+
+[backlinks]
+
+
+"bin/claude-klabauter-doctor-probe.py" = "archive/specs/2026-07/2026-07-21-claude-klabauter-pure-python-shop-retire-all-bash.md § C7"

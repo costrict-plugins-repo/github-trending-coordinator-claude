@@ -1,0 +1,127 @@
+# project-rag exclusion surface — starter set for a coordinator-system repo.
+#
+# Committed at the repo root, so it survives a fresh clone with no machine-local
+# setup. That is the whole point of this channel: an exclusion configured only in
+# an operator's machine-local registry reproduces nothing for the next person who
+# clones the repo. Knowledge a repo has about its own trees belongs in the repo.
+#
+# Contract: one glob per line, `#` starts a comment, blank lines skipped. A
+# `dir/**` pattern prunes the directory itself and everything beneath it, and
+# matching is case-insensitive. Composition order and channel-choice rules live
+# in project-rag `docs/wiki/artifact-shape-conformance/exclusion-surface.md`.
+#
+# This surface only ADDS exclusions, with one narrow exception: a `!path/` line
+# re-includes a path that project-rag's built-in ignore set prunes by name. It
+# cannot re-include anything this file, or any other exclusion channel,
+# excludes. Prefer leaving a
+# borderline tree indexed: adding a pattern later is cheap, and a tree nobody can
+# retrieve is invisible rather than obviously missing.
+#
+# What deliberately STAYS indexed in a coordinator repo: the RECORD — decisions,
+# wiki, lessons and queues under `docs/` and `state/`. In a doctrine repo the
+# prose IS the corpus, not noise around the code. Drafts and work-state (plans,
+# handoffs, sizings, sidecars) are excluded below and served instead by the
+# structural tier, which reads them off disk with no staleness window.
+
+# Terminal and superseded. Retained for provenance, not for retrieval — a query
+# that surfaces an archived baton over its live successor is a wrong answer.
+archive/**
+
+# The rule above is root-anchored and only prunes the top-level tree, missing
+# every nested `archive/` directory elsewhere in the repo — the same terminal-
+# and-superseded rationale applies at any depth. Named individually rather than
+# via a recursive `**/archive/**`, so this list only prunes the nested archive
+# trees this repo actually has, not any future directory that happens to be
+# named "archive" for an unrelated reason.
+docs/research/archive/**
+coordinator/archive/**
+coordinator/cockpit-contract/conformance/inputs/archive/**
+state/cross-repo/archive/**
+cross-repo/archive/**
+
+# Per-dispatch ephemera: agent sidecars and review diffs. In an active repo this
+# is the single largest tree by file count, and it answers nothing the plan,
+# decision, or lesson it was produced for does not answer better and more
+# durably.
+state/subagent-share/**
+state/review-trail/**
+
+# The coordinator's gitignored per-machine scratch root: subagent-share, plan
+# sidecars, dispatch briefs, review trail and memo outbox all land here. Excluded
+# whole rather than subtree by subtree — a per-subtree list fails open on every
+# new subtree the coordinator adds. Gitignored is not excluded: this surface does
+# not read `.gitignore`, and leading-dot directories are not pruned by default,
+# so this line is required, not redundant.
+.coordinator-local/**
+
+# Fast-moving work-state. The semantic surface is the WRONG tier for these, on a
+# refresh-cost argument rather than a value one: an embeddings run is slow and
+# infrequent, so a tree that turns over daily is stale in the index almost all of
+# the time, and a confidently-returned stale baton is worse than no hit at all.
+#
+# These trees are not being made unreachable — they are being routed to the tier
+# that serves them better. `project_workstate_query` (source='local-fence') reads
+# these off disk at call time with no staleness window whatsoever, and
+# `project_fleet_frontmatter_query` reads graph.db, which reprimes far faster
+# than the embedding corpus. Structural retrieval over fast-moving state beats
+# semantic retrieval over a stale snapshot of it.
+#
+# This costs no prior-art capability, which is worth stating explicitly because
+# it looks like it should. "Has anyone tried this before?" is a wiki-and-
+# decisions question by construction: plans are drafts that get distilled into
+# `coordinator/docs/wiki/` and `docs/decisions/`, and both stay indexed. A plan
+# holding prior art its wiki page does not is a DISTILLATION gap, to be fixed by
+# distilling it — not a retrieval gap to be worked around by indexing drafts.
+# Searching the drafts instead is how the answer ends up sourced from the
+# superseded version.
+#
+# Standing dependency: this holds only while the wiki is actually reachable
+# semantically. These exclusions are not safe in isolation — they are safe
+# *given* an indexed wiki. If your wiki tree is outside the embedding corpus,
+# prior-art recall runs on the structural tier alone and this trade is not the
+# one described above.
+state/handoffs/**
+docs/plans/**
+
+# Same rule, same reasoning. Sizings are per-ask triage records with the same
+# daily turnover as the handoffs above. Plan sidecars are per-plan working
+# artifacts and follow their plan out of the corpus by construction — leaving 746
+# sidecar files indexed while their plans are not would retrieve the scaffolding
+# without the thing it was scaffolding, which is the same claim-severed-from-
+# verdict hazard that put subagent-share on this list.
+state/sizings/**
+state/plan-sidecars/**
+
+# Swept scratch — non-durable working space by convention.
+tasks/**
+scratchpad/**
+
+# Tool caches and derived indexes — regenerable, never authored.
+.pytest_cache/**
+.structural-index/**
+__pycache__/**
+coordinator/dist/**
+
+# project-rag's own runtime artifacts, which land in this tree rather than its
+# own: bm25 caches, chunk-distribution dumps, embed-sidecar logs. This is the
+# data dir `project_health` reports as orphaned. Indexing a retrieval engine's
+# scratch into the corpus it serves is a loop worth breaking explicitly.
+Saved/**
+
+# Working scratch, same class as `scratchpad/**` and `tasks/**` above under
+# different names.
+scratch/**
+state/scratch/**
+
+# Per-dispatch ephemera, same class as subagent-share above: a brief is the
+# instruction handed to one worker for one run, superseded by whatever that run
+# produced.
+state/dispatch-briefs/**
+
+# Machine-generated caches that are single enormous files. These dominate a
+# chunk budget out of all proportion to their size on disk: project-rag-ue-addon
+# measured `.claude/repomap-cache/cache.json` alone at 63,078 chunks — 54% of
+# that repo's entire total — from one file regenerated by generate-repomap.py.
+# Present in most coordinator repos at 4-14 MB.
+.claude/repomap-cache/**
+state/cockpit-emission.json

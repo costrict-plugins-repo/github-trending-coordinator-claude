@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""PreToolUse(Bash|PowerShell) fan-in dispatcher -- the sole
+`Bash|PowerShell`-matcher registration in hooks.json
+(state/audits/2026-08-16-doe-hook-consolidation-feasibility.md).
+
+The five guards `guard-doctrine-surface-bash-write`,
+`guard-repo-setup-claude-home-refusal`, `guard-host-subagent-bash-ban`,
+`guard-host-subagent-bash-spawn-shapes` and `guard-subagent-heavy-ue-launch`
+have their bodies in `coordinator_core.bash_guards.*` and are registered by
+the control-plane engine itself; this stub is a pure relay to the
+engine-backed dispatch below.
+
+Original module purpose (still the majority of this file, unchanged below):
+replaces the former ~11-script bash dispatcher (which itself folded the
+no-verify, destructive-git-orphan, destructive-rm, destructive-git-clean,
+destructive-git-revert, blanket-git-add, runaway-find, git-c-over-cd, and
+probe-spray guards, plus commit validation) PLUS the 5-fold
+subagent-identity cohort (subagent-plan-body-bash-write,
+reviewer-bash-outside-allowlist, subagent-destructive-action,
+subagent-scoped-commit, illegal-filename
+Bash leg) with ONE `python3` PreToolUse(Bash) registration — zero Git-Bash
+cold-starts per Bash tool call (each bash.exe spawn costs 200-500ms on
+Windows; this is the whole point, mirroring `preuse-write-dispatch.py`'s
+rationale for the Write/Edit/MultiEdit/NotebookEdit side).
+
+The doctrine plane owns only this thin PLUMBING shim (DR-047 transport-seam carve-out):
+resolve the engine repo, hand it the raw payload, relay its stdout. The engine
+repo owns the guard LOGIC (`coordinator_core.bash_guards.dispatch`, which reuses
+`coordinator_core.bash_guards.*` and `coordinator_core.subagent_sandbox`).
+The engine is imported and run IN-PROCESS — no bash, no `python3 -m`
+subprocess re-spawn — so a whole Bash tool call pays exactly one Python
+interpreter start.
+
+Contract (mirrors the bash dispatcher it replaces):
+  stdin   — PreToolUse JSON (tool_name, tool_input.command, session_id, cwd,
+            agent_id…)
+  stdout  — one nested hookSpecificOutput JSON envelope on deny/rewrite/
+            advisory; NOTHING on allow
+  exit 0  — always (ALLOW/DENY conveyed via stdout, never exit code)
+
+Graceful degradation — REQUIRED: any failure to resolve/import/run the
+engine repo falls through to fail-open ALLOW (exit 0, no stdout), except for
+the one in-shim floor, `_degraded_stash_deny` (a subagent's stash-creating
+command is still denied). A missing sibling engine must NEVER brick every
+Bash tool call — identical
+philosophy to `preuse-write-dispatch.py`'s engine-resolution fallback.
+
+The bash-to-Python cutover is complete; this dispatcher is the sole
+PreToolUse(Bash) registration in hooks.json.
+
+Spec backlink: scratch/subagent-sandbox/bash-to-python-migration/
+W3a-preuse-bash-recipe.md Sec(c)
+
+Policy-path injection (C5a, 2026-07-27): every resolution leg inside
+the engine repo's ``engine.load_policy()`` -- explicit path -> ``SUBAGENT_SANDBOX_
+POLICY`` env (set by no code in either repo) -> ``_resolve_default_policy_
+path()``, which that module's own docstring calls "deliberately weak" --
+fail-opens to an empty ``Policy`` unless a caller hands it an explicit path.
+This dispatcher computes that path the same way
+``enforce-agent-dispatch-mode.py`` already does for its own subprocess call
+(``Path(__file__).resolve().parents[2] / "subagent-sandbox-policy.yaml"``)
+and passes it to ``evaluate_payload_json`` as an explicit ``policy_file``
+keyword -- the in-process equivalent of that other script's ``--policy
+<policy_file>`` subprocess flag -- rather than leaving resolution to the
+weak in-process fallback chain. Precedent on record:
+cross-repo/archive/2026-07-25-claude-klabauter-em-code-reviewer-sidecar-provisioning-fails-most-spawns.md
+documents this exact mechanism silently fail-opening on 4 of 5 spawns in
+production.
+
+``evaluate_payload_json`` does not accept ``policy_file`` yet as of this
+commit -- that signature change is a separate engine-side chunk (C6). This
+call site feature-detects via ``inspect.signature`` and only passes the
+keyword once the callee declares it, so behavior is byte-for-byte identical
+to today until C6 lands, and starts flowing the explicit path automatically
+the moment it does -- no further edit to this file required.
+
+Resolution-class injection (2026-08-05): this dispatcher resolves the engine
+via ``resolve_claude_klabauter_root_with_class`` and forwards the class alongside the
+root, under the same feature-detect idiom as ``policy_file`` above.
+
+Why it matters here specifically, rather than as diagnostics: a consumer
+executing a half-written engine mid-edit sees a guard behaving oddly, a Bash
+call wrongly denied, or an op erroring -- none of which is distinguishable,
+from this seat, from that engine behaving correctly. That is the half of the
+defect ``_engine_root.resolve_claude_klabauter_root_with_class`` calls
+silent-by-construction, and it cost a sibling plane two days on a wrong
+theory. Calling the class-dropping ``resolve_claude_klabauter_root`` wrapper here threw
+the answer away at the one seam best placed to report it.
+
+This shim resolves and forwards; the engine plane decides what to render,
+since the guard MESSAGE is engine-owned under the same DR-047 split as the
+guard logic. Until ``evaluate_payload_json`` declares ``resolution_class``,
+the keyword is not passed and behavior is byte-for-byte identical to today.
+
+This dispatcher resolves via ``resolve_claude_klabauter_root_with_provenance`` (the
+three-value seam) for ``resolution_class``; the third value, ``provenance``,
+is resolved but not forwarded -- ``evaluate_payload_json`` declares no
+``provenance`` keyword, so there is no feature-detect arm for it here (unlike
+``resolution_class`` and ``policy_file`` above). If the engine plane later
+wants this value forwarded, that is a fresh ask, not a revival of dead code.
+"""
+
+from __future__ import annotations
+
+import inspect
+import json
+import re
+import sys
+from pathlib import Path
+
+try:
+    from _engine_root import (  # noqa: E402
+        arm_lazy_ops as _arm_lazy_ops,
+        resolve_claude_klabauter_root_with_provenance as _resolve_engine,
+    )
+except Exception:
+    # Defensive fallback -- a hook script copied/deployed WITHOUT its
+    # sibling _engine_root.py (e.g. an isolated test harness, or a
+    # partial deploy) must still fail-open rather than crash on import.
+    # "unresolved" is spelled literally rather than imported as
+    # RESOLUTION_UNRESOLVED: this leg exists precisely for the case where
+    # that module is absent, so it cannot depend on a name from it.
+    def _resolve_engine() -> tuple[str | None, str, str]:
+        return None, "unresolved", "none"
+
+    def _arm_lazy_ops() -> None:
+        return None
+
+
+# Degraded-mode floor -- the one guard this shim enforces itself. Every engine-side
+# guard fails open when the engine cannot be resolved, imported, or run, and a
+# subagent's whole-tree `git stash` on a shared tree sweeps every concurrent
+# session's uncommitted work. This mirrors `block_subagent_stash_creation`'s
+# posture (subagents only; the raw `agent_id` field is the discriminant) with a
+# deliberately narrow textual matcher. It runs ONLY on the fail-open legs: when the
+# engine answers, its verdict is the whole verdict. Prose that merely mentions
+# `git stash -u` also trips it, but only for a subagent while the engine is down.
+_STASH_CREATE_RE = re.compile(
+    r"(?:^|[;&|(`\s])git"
+    r"(?:\s+(?:-[Cc]\s+\S+|--[\w-]+(?:=\S+)?|-\w+))*"
+    r"\s+stash(?=\s*(?:$|[;&|)<>`]|\d*>|-|(?:push|save)\b))",
+    re.MULTILINE,
+)
+
+_STASH_DEGRADED_DENY_REASON = (
+    "Did you mean one of these instead? Neither touches the shared worktree:\n"
+    "  - Whole-tree baseline:  git archive <sha> | tar -x -C <tmpdir>\n"
+    "  - Single file:          git show <sha>:<path>\n\n"
+    "BLOCKED: `git stash` creates a stash entry, and on a shared working tree a "
+    "stash is GLOBAL -- it sweeps every concurrent session's uncommitted work, not "
+    "just yours. This refusal is enforced even though the engine-backed guards are "
+    "unreachable on this machine.\n\n"
+    "  Command:  %s\n"
+)
+
+
+def _degraded_stash_deny(raw: str) -> dict | None:
+    """Deny verdict for a subagent's stash-creating command, else None (allow).
+
+    Unparseable payloads and payloads with no `agent_id` (the main-loop EM) allow.
+    """
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not payload.get("agent_id"):
+        return None
+    tool_input = payload.get("tool_input")
+    cmd = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(cmd, str) or not _STASH_CREATE_RE.search(cmd.replace("\r", "")):
+        return None
+    shown = cmd if len(cmd) <= 200 else cmd[:200] + "..."
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": _STASH_DEGRADED_DENY_REASON % shown,
+        }
+    }
+
+
+def _emit(verdict: dict | None) -> int:
+    if verdict is not None:
+        sys.stdout.write(json.dumps(verdict))
+        sys.stdout.write("\n")
+    return 0
+
+
+def main() -> int:
+    # SAFETY BARRIER, not only a cold-start optimization: this function
+    # runs as a FRESH subprocess per PreToolUse(Bash) event, reads the
+    # candidate command from stdin as inert text, and never shell-execs it
+    # -- so no COORDINATOR_OVERRIDE_*/COORDINATOR_ALLOW_* env var a subagent
+    # tries to set via an inline `VAR=1` prefix, `export`, or `env` wrapper
+    # inside the candidate command can ever reach this process's
+    # os.environ, which is the only thing `dispatch_checks._override()`
+    # reads. Pooling/reusing this process across events to cut the
+    # per-call spawn cost would silently delete that guarantee. Pinned in two
+    # halves, in two repos, because a pooling change can be made from either
+    # side: the behavioural half by
+    # coordinator_core/bash_guards/tests/test_override_unreachability_boundary.py
+    # (the engine repo), and the registration half -- that hooks.json keeps
+    # this wired as a per-event `type: "command"` hook -- by
+    # coordinator/tests/test_bash_guard_hook_stays_per_event.py (here).
+    # Do not "fix" either test's failure by deleting it; re-key the affected
+    # confinement guards onto resolved caller-context first.
+    raw = sys.stdin.read()
+
+    # The payload reaches the engine dispatch with the tool_name the caller actually
+    # used. NEVER normalize it, here or at any transport layer: the engine's guards read
+    # the dialect themselves and gate their PowerShell conversions on it, so a rewritten
+    # tool_name silently deletes the conversions that depend on the real value. If a
+    # matcher ever needs a normalized form, compute a LOCAL value for that gate and
+    # leave payload["tool_name"] untouched.
+    root, resolution_class, _provenance = _resolve_engine()
+    if not root:
+        return _emit(_degraded_stash_deny(raw))  # engine unresolvable on this machine
+
+    from _engine_root import place_engine_root_on_path as _place_engine_root_on_path
+    _place_engine_root_on_path(root)
+
+    # Must precede the first coordinator_core.* import -- see
+    # _engine_root.arm_lazy_ops for the package-init cost this avoids. This dispatcher
+    # is the hottest hook stub in the system: one fresh subprocess per PreToolUse(Bash)
+    # event.
+    _arm_lazy_ops()
+
+    try:
+        from coordinator_core.bash_guards.dispatch import evaluate_payload_json
+    except Exception:
+        return _emit(_degraded_stash_deny(raw))  # engine unimportable
+
+    # __file__ parents: [0]=scripts [1]=hooks [2]=coordinator(plugin root) -- same depth
+    # as enforce-agent-dispatch-mode.py's identical computation, since both scripts live
+    # in this same directory.
+    policy_file = Path(__file__).resolve().parents[2] / "subagent-sandbox-policy.yaml"
+
+    try:
+        _params = inspect.signature(evaluate_payload_json).parameters
+        accepts_policy_file = "policy_file" in _params
+        accepts_resolution_class = "resolution_class" in _params
+    except (TypeError, ValueError):
+        accepts_policy_file = False
+        accepts_resolution_class = False
+
+    kwargs = {}
+    if accepts_policy_file:
+        kwargs["policy_file"] = str(policy_file)
+    if accepts_resolution_class:
+        kwargs["resolution_class"] = resolution_class
+
+    try:
+        out = evaluate_payload_json(raw, **kwargs)
+    except Exception:
+        # Any engine failure falls open (never brick a Bash call) except the stash floor.
+        return _emit(_degraded_stash_deny(raw))
+
+    return _emit(out)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

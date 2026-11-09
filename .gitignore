@@ -1,0 +1,58 @@
+# Machine-specific
+settings.local.json
+
+# Session data (not part of the distribution)
+# Anchored to repo root: ephemeral session plans/ at root are ignored,
+# but docs/plans/ (canonical, tracked design history) is not shadowed.
+/plans/
+tasks/
+archive/
+projects/
+.remember/
+
+# Claude Code local state
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Experiment results (API outputs, reports)
+experiments/results/
+
+# Node
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+
+# Coordinator universal scratch rule (added 2026-05-20)
+scratch/
+tasks/_*.log
+
+# A percolate round's own state, written into the mirror by the round that ran. Round
+# working memory, not published product: tracking it makes each round's manifest a diff
+# in the next one. See coordinator-tripwires/a-rounds-own-manifest-is-not-payload.md.
+.percolate/
+
+# Group-EM watch runtime state -- a Stop hook appends one park record per turn end,
+# and the watch/parked files carry this box's clock and session ids. Per-machine, no
+# cross-clone reader; tracking any of them ships one box's runtime to every peer.
+state/group-em-watch.json
+state/group-em-watch-parked.json
+state/group-em-watch-spool.jsonl
+
+# Engine-provenance ledger -- the engine appends one record per engine-root resolution,
+# each carrying this box's absolute engine path and clock. Same per-machine class as the
+# watch trio above: regenerable, no cross-clone reader.
+state/engine-provenance-counts.jsonl
+
+# Per-machine session machinery, written by the engine's session machinery-paths writer on
+# any engine-backed ceremony. Generated, never authored; untracked, it leaves the tree dirty.
+.coordinator-local/

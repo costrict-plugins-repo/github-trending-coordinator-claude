@@ -1,0 +1,1209 @@
+r"""plan-spine-check — validate a plan's `## Tasks` spine against plan-tasks.schema.json.
+
+WHY THIS EXISTS. The schema has been the authoring contract for the task spine since 1.4.0, and
+until now nothing ran it. Every consumer validates late and from inside its own job: the dispatch
+emitter refuses at emit time, a wave-builder refuses at fire time, and a reviewer catches it only
+by hand-validating on their own initiative. So an invalid spine survives authoring, survives
+review integration, and surfaces as "this plan produces nothing" at the point where somebody was
+trying to execute it.
+
+Measured 2026-09-10, plan-blitz run 20260910T114745Z fire 1, on
+`docs/plans/2026-09-02-sanctioned-executor-amendment-channel.md`: a review integrator applying a
+BLOCKING finding removed chunk C0 and re-pointed four `depends_on` edges at
+`artifact: <path>` + `gate_kind: file-existence`. That shape fails three ways per edge — `chunk`
+is required, `file-existence` is not in the closed two-value `gate_kind` enum, and `artifact` is
+not an admissible property — and four of the plan's five rows carried it. The integrator wrote it,
+the citation-resolution pass did not look, and the readiness gate caught it only because that
+particular reviewer chose to run the schema themselves. The other two plans in the same fire
+validated clean, so nothing about the wave was systematically broken; the check simply did not
+exist to be run.
+
+WHAT IT DOES NOT DO. It does not judge the plan, the wave shape, or whether a declared dependency
+is the RIGHT one — only whether each row is a shape the schema admits. It writes nothing. It
+resolves no engine op and spawns no subprocess: the fenced-block locator is this engine's own
+(`coordinator_core.frontmatter.body_blocks`, imported, never re-transcribed), and validation is
+`jsonschema` over bytes already on disk.
+
+A plan carrying NO `## Tasks` spine is reported `NO-SPINE` and is not a failure. Plenty of plans
+legitimately carry none, and conflating "absent" with "invalid" is how a checker gets ignored.
+
+TWO CLASSES, BECAUSE THE CORPUS CARRIES TOLERATED VINTAGE AND THE SCHEMA SAYS SO. An unadmitted
+property, a wrong type, a closed-enum violation, a missing required key on an edge is STRUCTURAL
+and fails; a retired `change_kind` value or an absent legacy conditional key the schema's own
+`x-bump-note` says is deliberately NOT retro-opened is LEGACY and does not.
+
+A THIRD CLASS, PM-BRIEF TRACEABILITY, STRUCTURAL. When a plan carries a `## PM brief` body
+section (`coordinator/bin/lib/pm_brief.py :: extract_brief_section`), every non-deferred row whose
+`disposition` is `open` or `coded` must carry a `traces_to_brief` that is a substring of that
+section (`pm_brief.trace_ok`); a row left untraced fails the same exit as the first class. A plan
+with no `## PM brief` section reports a single informational `NO-BRIEF` line and sets no failure:
+that plan never opted in.
+
+A FOURTH CLASS, ADVISORY, NEVER FATAL EITHER WAY. `--for-execution` marks the plan as
+execution-bound. Without the flag, an `open`, `execution_mode: agent` row with UNDECLARED `writes`
+(key absent or null, and no `writes_under`) is reported `advisory`, never fatal. WITH the flag,
+that same finding is STRUCTURAL and sets the failing exit. `writes: []` is a positive "writes
+nothing" assertion (the schema's own spelling) -- DECLARED, never UNDECLARED, under either flag.
+(A path in both `reads_at_head` and `consumes`/`reads` is the one exception: STRUCTURAL, the
+predicate being `spine_read.contradictory_read_paths`, the same one dispatch.emit refuses on.)
+Two more findings live in this class and are never fatal, flag or no flag: a `reads_at_head` path
+another row writes (declare `consumes` instead if the output is actually needed), and a `consumes`
+path no row writes (orders nothing -- use `reads_at_head`). `LEGACY-READS` is a plain notice on
+any row carrying `reads:`. Paths are normalised from `\` to `/` before comparison.
+
+Arrived from coordinator-content-repo coordinator/bin/plan-spine-check.py (docs/plans/2026-09-18-doe-holds-no-
+scripts.md, chunk W2-C9; the fourth-class port above from docs/plans/2026-09-27-plan-shape-for-
+width.md C9/C5, requirement-restated as W2-C9 did). Requirement-restated, not carried verbatim:
+the DoE-side `_locate_spine` resolved `coordinator_core` through an `_engine_root` seam because
+that copy lived outside the engine; this copy lives inside it, so the locator and the schema
+resolve through this module's own tree (§ Path resolution, "engine" class) with no seam at all.
+
+Spec backlink: docs/plans/2026-09-18-doe-holds-no-scripts.md, chunk W2-C9.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import shlex
+import sys
+from pathlib import Path
+
+EXIT_OK = 0
+EXIT_INVALID = 1
+EXIT_UNREADABLE = 2
+
+#: Findings the schema itself declares tolerated on the existing corpus -- reported, never fatal.
+#: Both families are quoted in this module's docstring from `plan-tasks.schema.json`'s own
+#: `x-bump-note`. Widening this set silences real defects, so it is a closed list, not a pattern.
+_LEGACY_CONDITIONAL_KEYS = ("pm_approved", "case_against", "disposition_ref", "disposition_detail")
+
+
+#: jsonschema echoes the offending INSTANCE into some messages -- a `not` violation on a task row
+#: reproduces the whole row, bodies and all, which on this corpus is thousands of characters of
+#: unreadable output for a one-line defect. Truncate at the point the message stops being about
+#: the schema and starts being about the data the reader already has open.
+_MESSAGE_CAP = 160
+
+
+def _trim(message: str) -> str:
+    collapsed = " ".join(message.split())
+    if len(collapsed) <= _MESSAGE_CAP:
+        return collapsed
+    return collapsed[:_MESSAGE_CAP].rstrip() + " …"
+
+
+def _message_for(error) -> str:
+    """The schema's complaint, never the instance that triggered it.
+
+    A `not` violation's default message reproduces the whole offending row -- on a plan spine that
+    is every chunk body verbatim. The reader has the file open; what they lack is the CONDITION,
+    which `validator_value` carries directly.
+    """
+    if error.validator == "not":
+        return f"row must NOT satisfy {error.validator_value} here (a conditional branch forbids it)"
+    if error.validator == "enum" and error.instance == "done" and list(error.path)[-1:] == ["disposition"]:
+        return "disposition `done` is not a spine value; write `coded` (with a ship-commit disposition_ref)"
+    if error.validator == "pattern" and list(error.path)[:1] == ["writes"]:
+        return (
+            f"writes: {error.instance!r} is a directory; entries are files, one per path "
+            "(directories go in `writes_under:`)"
+        )
+    return error.message
+
+
+def _is_legacy(at: str, message: str) -> bool:
+    if at == "change_kind" and "is not one of" in message:
+        return True
+    return any(f"'{key}' is a required property" == message for key in _LEGACY_CONDITIONAL_KEYS)
+
+
+class CheckError(RuntimeError):
+    """A precondition this module cannot proceed without, named rather than guessed."""
+
+
+def _norm_path(path) -> str:
+    if not isinstance(path, str):
+        return path
+    return path.replace("\\", "/")
+
+
+_WIDTH_RATIONALE_HEADING_RE = re.compile(r"^##\s+Width rationale\s*$", re.M)
+_ANY_HEADING_RE = re.compile(r"^#{1,6}\s+\S", re.M)
+
+
+def _width_rationale(text: str) -> "str | None":
+    """The non-empty body of a `## Width rationale` section, or None if absent/empty."""
+    match = _WIDTH_RATIONALE_HEADING_RE.search(text)
+    if not match:
+        return None
+    rest = text[match.end():]
+    next_heading = _ANY_HEADING_RE.search(rest)
+    body = rest[: next_heading.start()] if next_heading else rest
+    body = body.strip()
+    return body or None
+
+
+#: Test seam: set to `(read_spine, build_dag)` to inject a stub in place of the engine's own.
+_ENGINE_WIDTH_FNS_OVERRIDE = None
+
+
+def _resolve_engine_width_fns():
+    if _ENGINE_WIDTH_FNS_OVERRIDE is not None:
+        return _ENGINE_WIDTH_FNS_OVERRIDE
+    _ensure_engine_on_path()
+    from coordinator_core.ops.dispatch_emit.spine_read import read_spine
+    from coordinator_core.ops.dispatch_emit.wave_map import build_dag
+
+    return read_spine, build_dag
+
+
+def _compute_width(path: Path):
+    """`(width_dict, unavailable_reason)` -- never raises, so a width failure cannot fail the check.
+
+    The graph is `wave_map.build_dag`'s: `max_width` = `max_concurrent_rows`, `critical_path_rows`
+    as published, `dispatchable_rows` = `len(nodes)`; only `critical_path_share` is computed here.
+    """
+    try:
+        read_spine, build_dag = _resolve_engine_width_fns()
+    except ImportError as exc:
+        return None, f"engine predates the width function ({exc})"
+    except Exception as exc:  # noqa: BLE001 - width is advisory; report, never crash
+        return None, f"engine unreachable: {exc}"
+    try:
+        dag = build_dag(read_spine(path))
+    except Exception as exc:  # noqa: BLE001 - report, never crash the checker
+        return None, f"width computation failed: {exc}"
+    dispatchable_rows = len(dag.nodes)
+    critical_path_rows = dag.critical_path_rows
+    share = (critical_path_rows / dispatchable_rows) if dispatchable_rows else 0
+    return {
+        "max_width": dag.max_concurrent_rows,
+        "critical_path_rows": critical_path_rows,
+        "dispatchable_rows": dispatchable_rows,
+        "critical_path_share": share,
+    }, None
+
+
+def _ensure_engine_on_path() -> None:
+    """Put the engine root on `sys.path`, fail-loud — the same self-location-first bootstrap
+    every other `coordinator/bin/*.py` engine-backed CLI uses (see e.g.
+    `coordinator/bin/compose-review-wave.py`). Idempotent: `require_colocated_engine_on_path`
+    front-inserts onto `sys.path` and a second call is harmless."""
+    import lib  # noqa: F401 -- bootstraps coordinator/bin/lib onto sys.path
+    from cc_invoke import require_colocated_engine_on_path
+
+    require_colocated_engine_on_path(__file__)
+
+
+def _schema_path() -> Path:
+    # Resolved off the imported package, never by walking up from `__file__`: this CLI is
+    # published one directory shallower than it is authored (claude-klabauter#30).
+    _ensure_engine_on_path()
+    import coordinator_core.frontmatter as frontmatter
+
+    return Path(frontmatter.__file__).resolve().parent / "schemas" / "plan-tasks.schema.json"
+
+
+def _pm_brief_module():
+    """Import `coordinator/bin/lib/pm_brief.py` through the `lib` bootstrap."""
+    import lib  # noqa: F401 -- bootstraps coordinator/bin/lib onto sys.path
+    import pm_brief
+
+    return pm_brief
+
+
+def _locate_spine(text: str):
+    """The `## Tasks` ```yaml plan-tasks block, via the engine's own locator.
+
+    Imported directly: this module lives inside the engine, so the fence rules (heading match,
+    info string, blanking of nested fences) resolve through this module's own tree with no seam —
+    a second copy here is how the two would drift into disagreeing about what a spine even is.
+    """
+    _ensure_engine_on_path()
+    try:
+        from coordinator_core.frontmatter.body_blocks import LocateStatus, locate_fenced_block
+    except Exception as exc:  # pragma: no cover - import-shape guard
+        raise CheckError(f"coordinator_core.frontmatter.body_blocks unimportable: {exc}")
+
+    result = locate_fenced_block(text)
+    return result, LocateStatus
+
+
+def check_plan(path: Path, for_execution: bool = False) -> dict:
+    """One plan's verdict: PREPPED-shaped report, never a raise for an ordinary outcome."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {"path": str(path), "verdict": "UNREADABLE", "detail": str(exc), "rows": []}
+
+    body_finding = _approved_body_finding(text, for_execution)
+
+    report = _check_spine(path, text, for_execution)
+    if body_finding is not None:
+        if body_finding["class"] == "structural":
+            report["rows"].append(body_finding)
+            report["verdict"] = "INVALID"
+        else:
+            report.setdefault("advisories", []).append(body_finding)
+    anchor_finding = _falsifier_anchor_advisory(text)
+    if anchor_finding is not None:
+        report.setdefault("advisories", []).append(anchor_finding)
+    goal_finding = _goal_falsifier_finding(path, text, for_execution)
+    if goal_finding is not None:
+        report["rows"].append(goal_finding)
+        report["verdict"] = "INVALID"
+    gate_findings = _prep_gate_findings(path, text) + _extra_findings(path, text)
+    if gate_findings and report["verdict"] not in ("UNREADABLE",):
+        report["rows"].extend(gate_findings)
+        report["verdict"] = "INVALID"
+    return report
+
+
+#: prep_gate classes whose defects fail this check; the same predicates `plan.prep_gate` halts on.
+_PREP_GATE_CLASSES = ("SPINE", "REGISTER")
+
+
+def _prep_gate_findings(path: Path, text: str) -> list:
+    """Structural rows for the SPINE and REGISTER defects `prep_gate.gate_plan` reports, and for
+    the anchor-premise declaration defects `_anchor_premise.parse_anchors` reports. Terminal
+    (already-ran) plans owe nothing and yield none."""
+    _ensure_engine_on_path()
+    import yaml
+    from coordinator_core.frontmatter.primitives import split_frontmatter
+    from coordinator_core.ops import _anchor_premise
+    from coordinator_core.roadmap.prep_gate import gate_plan
+
+    root = _repo_root_of(path) or path.resolve().parent
+    try:
+        gate = gate_plan(root, path.resolve(), text=text)
+    except Exception as exc:  # noqa: BLE001 - an engine fault is reported, never a crash
+        return [
+            {
+                "row": "-",
+                "error": f"PREP-GATE-ENGINE-ERROR: {type(exc).__name__}: {exc}"[:300],
+                "at": "prep_gate",
+                "class": "advisory",
+            }
+        ]
+    if gate.get("terminal"):
+        return []
+    out = []
+    for cls in _PREP_GATE_CLASSES:
+        verdict = (gate.get("classes") or {}).get(cls) or {}
+        if verdict.get("status") in ("DEFECT", "REFUSE", "ERROR"):
+            rows = verdict.get("withheld") or []
+            out.append(
+                {
+                    "row": ",".join(rows) if rows else "-",
+                    "error": f"{cls} {verdict.get('kind')}: {_trim(str(verdict.get('detail') or ''))}",
+                    "at": cls,
+                    "class": "structural",
+                }
+            )
+    split = split_frontmatter(text)
+    fm = None
+    if split is not None:
+        try:
+            fm = yaml.safe_load(split.fm_text)
+        except yaml.YAMLError:
+            fm = None
+    if isinstance(fm, dict):
+        _anchors, defects = _anchor_premise.parse_anchors(fm, root)
+        for defect in defects:
+            out.append(
+                {"row": "-", "error": _trim(defect), "at": "anchor_premises", "class": "structural"}
+            )
+    return out
+
+
+def _falsifier_anchor_advisory(text: str):
+    """Advisory only: the falsifier `how` decides on an unanchored single-word substring."""
+    _ensure_engine_on_path()
+    import yaml
+    from coordinator_core.execute_plan_assemble.falsifier_shape import (
+        _falsifier_block,
+        falsifier_how_unanchored,
+    )
+    from coordinator_core.frontmatter.primitives import split_frontmatter
+
+    split = split_frontmatter(text)
+    if split is None:
+        return None
+    try:
+        fm = yaml.safe_load(split.fm_text)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(fm, dict):
+        return None
+    falsifier = _falsifier_block(fm.get("prime_exit_criterion"))
+    word = falsifier_how_unanchored(falsifier["how"]) if falsifier else None
+    if word is None:
+        return None
+    return {
+        "row": "-",
+        "error": (
+            f"UNANCHORED-FALSIFIER: `how` matches `{word}` as a bare substring, so any line "
+            "containing it passes — anchor it (`^`, `-w`, `-x`, `==`)"
+        ),
+        "at": "prime_exit_criterion.falsifier.how",
+        "class": "advisory",
+    }
+
+
+def _goal_falsifier_finding(path: Path, text: str, for_execution: bool):
+    """The close-out goal gate's arms 0/1, through the engine's own shared predicate."""
+    if not for_execution:
+        return None
+    _ensure_engine_on_path()
+    import yaml
+    from coordinator_core.execute_plan_assemble.falsifier_shape import goal_falsifier_defect
+    from coordinator_core.frontmatter.primitives import split_frontmatter
+
+    split = split_frontmatter(text)
+    if split is None:
+        return None
+    try:
+        fm = yaml.safe_load(split.fm_text)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(fm, dict):
+        return None
+    sizing = fm.get("sizing_object")
+    root = path.resolve().parent
+    if isinstance(sizing, str) and sizing.strip():
+        root = next(
+            (p for p in path.resolve().parents if (p / sizing.strip()).is_file()), root
+        )
+    defect = goal_falsifier_defect(fm, root)
+    if defect is None:
+        return None
+    return {
+        "row": "-",
+        "error": (
+            f"{defect}: M+ plan has no usable prime_exit_criterion.falsifier. "
+            "Author it via the falsifier step, or add a falsifier_exemption with a reason."
+        ),
+        "at": "prime_exit_criterion.falsifier",
+        "class": "structural",
+    }
+
+
+def _approved_body_finding(text: str, for_execution: bool):
+    if not for_execution:
+        return None
+    _ensure_engine_on_path()
+    from coordinator_core.frontmatter.primitives import (
+        APPROVED_BODY_CHANGED,
+        APPROVED_BODY_UNVERIFIABLE,
+        check_approved_body,
+    )
+
+    state, message = check_approved_body(text)
+    if state == APPROVED_BODY_CHANGED:
+        return {"row": "-", "error": message, "at": "approved_body_sha", "class": "structural"}
+    if state == APPROVED_BODY_UNVERIFIABLE:
+        return {"row": "-", "error": message, "at": "approved_body_sha", "class": "advisory"}
+    return None
+
+
+#: Basenames every package/test tree repeats by design; a collision on them names nothing reusable.
+_COLLISION_EXEMPT_BASENAMES = frozenset({"__init__.py", "conftest.py"})
+
+
+def _repo_root_of(path: Path) -> "Path | None":
+    """Nearest ancestor holding a `.git` entry (dir or worktree file); no git spawn."""
+    for candidate in path.resolve().parents:
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def _tracked_listing(path: Path, rows: list) -> list:
+    """The one `tracked_files` listing per check; empty when no row writes or no repo root."""
+    if not any(isinstance(r, dict) and r.get("writes") for r in rows):
+        return []
+    root = _repo_root_of(path)
+    if root is None:
+        return []
+    _ensure_engine_on_path()
+    from coordinator_core.git import ls_files
+
+    return ls_files.tracked_files(root) or []
+
+
+def _gate_created_elsewhere(text: str, rows: list, tracked: list) -> list:
+    """Advisories for a row a `row_build_gate` matches while another row creates the gate command.
+
+    A command token naming a `writes` path of row V absent from `tracked` is a created file;
+    every matched row other than V is flagged.
+    """
+    _ensure_engine_on_path()
+    from coordinator_core.ops.dispatch_emit.row_build_gate import (
+        gate_commands_for,
+        parse_row_build_gates,
+    )
+
+    gates = parse_row_build_gates(text)
+    if not gates or not tracked:
+        return []
+    tracked_set = set(tracked)
+    creators = []
+    for index, row in enumerate(rows):
+        if isinstance(row, dict):
+            label = row.get("id") or f"row {index + 1} (no id)"
+            writes = [p for p in (row.get("writes") or []) if isinstance(p, str)]
+            creators.append((label, row, writes))
+    out = []
+    for kind, glob, command in gates:
+        try:
+            tokens = shlex.split(command, posix=True)
+        except ValueError:
+            continue
+        tokens = {_norm_path(t).removeprefix("./") for t in tokens}
+        created = {}
+        for label, _row, writes in creators:
+            for w in writes:
+                norm = _norm_path(w).removeprefix("./")
+                if norm in tokens and norm not in tracked_set:
+                    created.setdefault(norm, label)
+        if not created:
+            continue
+        for label, row, writes in creators:
+            if command not in gate_commands_for(writes, row.get("change_kind"), ((kind, glob, command),)):
+                continue
+            for norm, creator in created.items():
+                if creator == label:
+                    continue
+                out.append(
+                    {
+                        "row": label,
+                        "error": (
+                            f"row_build_gate `{command}` matches this row, but the gate command "
+                            f"is created by another row ({creator} writes {norm}) "
+                            "— narrow the gate's `when`"
+                        ),
+                        "at": "row_build_gate",
+                        "class": "advisory",
+                    }
+                )
+    return out
+
+
+def _basename_collisions(rows: list, tracked: list) -> list:
+    """Advisories for each new `writes` path whose basename is tracked at another path.
+
+    "New" means absent from the shared `tracked` listing.
+    """
+    wanted = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        label = row.get("id") or f"row {index + 1} (no id)"
+        for p in row.get("writes") or []:
+            if isinstance(p, str):
+                wanted.append((label, p, _norm_path(p).removeprefix("./")))
+    if not wanted:
+        return []
+    if not tracked:
+        return []
+    tracked_set = set(tracked)
+    by_basename: dict = {}
+    for entry in tracked:
+        by_basename.setdefault(entry.rsplit("/", 1)[-1], []).append(entry)
+    out = []
+    for label, raw, norm in wanted:
+        base = norm.rsplit("/", 1)[-1]
+        if norm in tracked_set or base in _COLLISION_EXEMPT_BASENAMES:
+            continue
+        others = by_basename.get(base)
+        if not others:
+            continue
+        out.append(
+            {
+                "row": label,
+                "error": (
+                    f"BASENAME-COLLISION: new file {raw} collides with existing "
+                    f"{', '.join(others)} — reuse or justify"
+                ),
+                "at": "writes",
+                "class": "advisory",
+            }
+        )
+    return out
+
+
+#: Test seam: `fn(root: Path, patterns: list[str]) -> list[tuple[str, str]]` of `(test_path, line)`
+#: replacing the single `git grep`.
+_TEST_REFERENCER_GREP_OVERRIDE = None
+
+_TEST_PATH_RE = re.compile(r"(?<![\w./-])((?:[\w.-]+/)*(?:test_[\w-]+|[\w-]+_test)\.py)\b")
+_TEST_PATHSPECS = ("**/test_*.py", "**/tests/**/*.py", "**/*_test.py")
+
+
+def _is_test_path(norm: str) -> bool:
+    base = norm.rsplit("/", 1)[-1]
+    return base.endswith(".py") and (
+        base.startswith("test_") or base.endswith("_test.py") or "/tests/" in f"/{norm}"
+    )
+
+
+def _covered(norm: str, written_paths: set) -> bool:
+    """True when `norm` is a listed write or sits under a `writes_under` directory."""
+    return norm in written_paths or any(
+        not w.endswith(".py") and norm.startswith(w.rstrip("/") + "/") for w in written_paths
+    )
+
+
+def _module_patterns(norm: str) -> list:
+    """Import-site strings for one module: its dotted path and its file name."""
+    stem = norm[:-3]
+    parts = stem.split("/")
+    patterns = [norm.rsplit("/", 1)[-1]]
+    if all(part.isidentifier() for part in parts):
+        patterns.append(".".join(parts))
+    return patterns
+
+
+def _grep_test_referencers(root: Path, patterns: list) -> list:
+    if _TEST_REFERENCER_GREP_OVERRIDE is not None:
+        return _TEST_REFERENCER_GREP_OVERRIDE(root, patterns)
+    _ensure_engine_on_path()
+    from coordinator_core.git.run import run_git
+
+    argv = ["-C", str(root), "grep", "-n", "-F", "--no-color"]
+    for pattern in patterns:
+        argv += ["-e", pattern]
+    argv += ["--", *_TEST_PATHSPECS]
+    result = run_git(argv)
+    if not result.ok:
+        return []
+    hits = []
+    for line in result.stdout.splitlines():
+        head, _, rest = line.partition(":")
+        hits.append((head, rest))
+    return hits
+
+
+def _test_caller_findings(path: Path, rows: list, written_paths: set) -> tuple:
+    """`(advisories, structural)`: orphaned test referencers of written modules; unlisted done-when tests."""
+    advisories: list = []
+    structural: list = []
+    modules = []
+    root = _repo_root_of(path)
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        label = row.get("id") or f"row {index + 1} (no id)"
+        for p in row.get("writes") or []:
+            norm = _norm_path(p).removeprefix("./") if isinstance(p, str) else ""
+            if norm.endswith(".py") and not _is_test_path(norm):
+                modules.append((label, norm))
+        body = "\n".join(str(row.get(key) or "") for key in ("body", "done_when", "done-when"))
+        for match in dict.fromkeys(_TEST_PATH_RE.findall(body)):
+            cited = _norm_path(match).removeprefix("./")
+            # Only a full path no row creates and the tree lacks is unsatisfiable; a bare
+            # basename is ambiguous and an existing test is covered by the referencer advisory.
+            if (
+                "/" in cited
+                and not _covered(cited, written_paths)
+                and root is not None
+                and not (root / cited).exists()
+            ):
+                structural.append(
+                    {
+                        "row": label,
+                        "error": (
+                            f"UNLISTED-TEST: done-when/body cites test file {match} "
+                            "that no row writes and the tree lacks — add it to `writes`"
+                        ),
+                        "at": "body",
+                        "class": "structural",
+                    }
+                )
+    if not modules or root is None:
+        return advisories, structural
+    patterns = list(dict.fromkeys(p for _l, m in modules for p in _module_patterns(m)))
+    hits = _grep_test_referencers(root, patterns)
+    for label, module in modules:
+        mine = _module_patterns(module)
+        orphans = sorted(
+            {
+                _norm_path(test)
+                for test, line in hits
+                if any(p in line for p in mine) and not _covered(_norm_path(test), written_paths)
+            }
+        )
+        for test in orphans:
+            advisories.append(
+                {
+                    "row": label,
+                    "error": (
+                        f"TEST-REFERENCER-OUTSIDE-WRITES: {test} references {module} "
+                        "but no row writes it"
+                    ),
+                    "at": "writes",
+                    "class": "advisory",
+                }
+            )
+    return advisories, structural
+
+
+# Work units a same-wave executor sibling set must carry together to repay its spawns: every executor
+# spawn spends ~9% of its run orienting, so N siblings pay that N times. A code-kind row with a write
+# and a long acceptance is 3 units; two code-kind single-write rows (2 + 2) pass, only clear cases fail.
+_SIBLING_WORK_FLOOR = 4
+_LONG_ACCEPTANCE_CHARS = 300
+_CODE_KINDS = frozenset({
+    "code-edit", "script-edit", "hook-edit", "agent-prompt-edit", "skill-edit", "doctrine-edit", "wiki-new",
+})
+_EXECUTOR = "coordinator:executor"
+
+# Plan-status ladder, lowest first (coordinator-tripwires/plan-status-ladder.md).
+_STATUS_RANK = {"draft": 0, "reviewed": 1, "approved": 2, "executing": 3, "landed": 4, "implemented": 5}
+_GATE_MET_RE = re.compile(r"(?<!not )\b(met|satisfied|cleared|unblocked|already (?:landed|implemented))\b", re.I)
+_TASKS_BLOCK_RE = re.compile(r"```yaml plan-tasks.*?```", re.S)
+
+
+def _coordinator_lib() -> None:
+    """Put coordinator/lib on sys.path for the library modules the extra finding classes load."""
+    lib = str(Path(__file__).resolve().parent.parent / "lib")
+    if lib not in sys.path:
+        sys.path.insert(0, lib)
+
+
+def _row_writes(row: dict) -> "list | None":
+    """The row's declared write paths and prefixes, or None when it declares neither."""
+    writes, under = row.get("writes"), row.get("writes_under")
+    if not isinstance(writes, list) and not isinstance(under, list):
+        return None
+    return [str(w) for w in (writes or [])] + [str(u).rstrip("/") + "/" for u in (under or [])]
+
+
+def _row_work(row: dict) -> int:
+    units = len(_row_writes(row) or [])
+    units += row.get("change_kind") in _CODE_KINDS
+    units += len(str(row.get("acceptance") or "")) >= _LONG_ACCEPTANCE_CHARS
+    return units
+
+
+def _wave_levels(rows: list) -> dict:
+    """Row id -> depends_on depth. The engine's build_waves also splits write-overlapping rows into
+    later waves, so no public surface yields the depends_on-only level this check needs."""
+    deps = {
+        str(r.get("id")): [
+            str(e.get("chunk")) for e in (r.get("depends_on") or []) if isinstance(e, dict)
+        ]
+        for r in rows
+    }
+    levels: dict = {}
+
+    def level(rid: str, seen: frozenset) -> int:
+        if rid in levels:
+            return levels[rid]
+        if rid in seen:
+            raise ValueError("cycle")
+        value = 1 + max((level(d, seen | {rid}) for d in deps.get(rid, []) if d in deps), default=-1)
+        levels[rid] = value
+        return value
+
+    for rid in deps:
+        level(rid, frozenset())
+    return levels
+
+
+def micro_chunk_findings(rows: list) -> list:
+    """Same-wave executor sibling sets below `_SIBLING_WORK_FLOOR`, disjoint writes included.
+
+    A row carrying `disjoint_parallel: true` is exempt: the plan declares it parallel by design.
+    """
+    live = [r for r in rows if isinstance(r, dict) and r.get("disposition") != "deferred"]
+    try:
+        levels = _wave_levels(live)
+    except ValueError:
+        return []  # a dependency cycle is the engine verdict's to report
+    by_level: dict = {}
+    for r in live:
+        if (
+            r.get("agent_type") == _EXECUTOR
+            and _row_writes(r) is not None
+            and r.get("disjoint_parallel") is not True
+        ):
+            by_level.setdefault(levels[str(r.get("id"))], []).append(r)
+    found: list = []
+    for siblings in by_level.values():
+        if len(siblings) < 2:
+            continue
+        work = sum(_row_work(r) for r in siblings)
+        if work < _SIBLING_WORK_FLOOR:
+            ids = ", ".join(str(r.get("id")) for r in siblings)
+            found.append({
+                "class": "micro-chunk-siblings",
+                "detail": f"rows {ids} run in one wave and together carry {work} work units, under "
+                f"the spawn-tax floor of {_SIBLING_WORK_FLOOR}; merge them into one row, or set "
+                "`disjoint_parallel: true` on a row that is parallel by design",
+            })
+    return found
+
+
+def depends_on_plan_status_findings(text: str, raw_rows: list, repo_root: Path, prep_gate) -> list:
+    """Findings for a `depends_on_plan` entry whose named status the cited plan has not reached
+    while the plan prose (outside the spine) says that gate is met."""
+    prose = _TASKS_BLOCK_RE.sub("", text)
+    found: list = []
+    for row in raw_rows:
+        entries = row.get("depends_on_plan") if isinstance(row, dict) else None
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            named, cited = str(entry.get("status") or ""), str(entry.get("plan") or "")
+            if named not in _STATUS_RANK or not cited:
+                continue
+            cited_path = repo_root / cited.split(":", 1)[-1]
+            if not cited_path.is_file():
+                continue
+            actual = str(prep_gate.plan_frontmatter(cited_path.read_text(encoding="utf-8", errors="replace"))
+                         .get("status") or "")
+            if actual not in _STATUS_RANK or _STATUS_RANK[actual] >= _STATUS_RANK[named]:
+                continue
+            stem = cited_path.stem
+            if any(stem in line and _GATE_MET_RE.search(line) for line in prose.splitlines()):
+                found.append({
+                    "class": "depends-on-plan-status-mismatch",
+                    "detail": f"row {row.get('id')}: depends_on_plan {cited} names status {named!r} but the plan "
+                    f"is {actual!r} while the prose says the gate is met (name the status the prose requires)",
+                })
+    return found
+
+
+def contributed_signal_findings(fm: dict, raw_rows: list, repo_root: Path, contributed=None) -> list:
+    """One finding per installed-plugin overlay signal whose write trigger fires for the plan's writes
+    while `review_signals` lacks it. `contributed` is the overlay scan's `signals` list (default: scan
+    the installed plugins); with none installed this never fires."""
+    _coordinator_lib()
+    import plugin_review_signals
+
+    if contributed is None:
+        contributed = plugin_review_signals.scan()["signals"]
+    if not contributed:
+        return []
+    declared = fm.get("review_signals")
+    if isinstance(declared, str):
+        declared = declared.strip().strip("[]").split(",")
+    have = {str(s).strip().strip("'\"") for s in (declared if isinstance(declared, list) else [])}
+    writes: list = []
+    for row in raw_rows:
+        if isinstance(row, dict):
+            writes.extend(_row_writes(row) or [])
+    found: list = []
+    for sig in contributed:
+        if sig["id"] in have or not plugin_review_signals.signals_for_writes([sig], writes, repo_root):
+            continue
+        found.append({
+            "class": "contributed-signal-missing",
+            "detail": f"the plan's writes match plugin {sig['plugin']!r}'s declared write trigger but "
+            f"review_signals lacks {sig['id']!r}; add it so the plan routes to {sig['selects']}",
+        })
+    return found
+
+
+def _research_layout():
+    """coordinator/lib/research_layout.py loaded by path, as the write guard loads it."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parent.parent / "lib" / "research_layout.py"
+    spec = importlib.util.spec_from_file_location("research_layout", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def research_layout_findings(raw_rows: list, repo_root: Path, today: "str | None" = None) -> list:
+    """One finding per row `writes`/`writes_under`/`surface` path under docs/research/ that the write guard
+    would deny: `research_layout.classify` says nonconforming and the path's top-level entry does not
+    already exist on disk (existing legacy entries are grandfathered, as in the guard)."""
+    import datetime
+
+    layout = _research_layout()
+    today = today or datetime.date.today().isoformat()
+    marker = "docs/research/"
+    found: list = []
+    for row in raw_rows:
+        if not isinstance(row, dict):
+            continue
+        declared = list(_row_writes(row) or [])
+        if isinstance(row.get("surface"), str):
+            declared.append(row["surface"])
+        for raw in dict.fromkeys(declared):  # a row's `surface` usually repeats one of its `writes`
+            posix = raw.strip().replace("\\", "/")
+            if posix.startswith("./"):
+                posix = posix[2:]
+            if not posix.startswith(marker):
+                continue
+            rel = posix[len(marker):]
+            parts = [p for p in rel.split("/") if p not in ("", ".")]
+            if not parts or (repo_root / "docs" / "research" / parts[0]).exists():
+                continue
+            if layout.classify(rel) != layout.NONCONFORMING:
+                continue
+            hint = "docs/research/<topic>/<date>-<run-slug>/synthesis.md"
+            if len(parts) == 1:
+                try:
+                    hint = f"docs/research/{layout.conforming_path_for(parts[0], today)}"
+                except ValueError:
+                    pass
+            found.append({
+                "class": "research-layout",
+                "detail": f"row {row.get('id')}: {raw!r} is not a conforming research path and the write guard "
+                f"denies it at execution; write {hint} instead (layout: docs/research/<topic>/<date>-<run-slug>/ "
+                "with children synthesis.md, trail.yaml, verdict.md, outputs/, workdir/)",
+            })
+    return found
+
+
+def abs_path_findings(text: str) -> list:
+    """Absolute path literals in the plan text, from the detector test_no_absolute_path_literals uses.
+
+    Scanned with no filename so fenced spine blocks are not exempt; the same-line
+    `abs-path-ok: <reason>` marker is honoured by the detector.
+    """
+    try:
+        from coordinator_core.ops.session import guard_concrete_path_citations as detector
+
+        hits = detector.detect_in_text(text, "")
+    except (ImportError, AttributeError) as exc:
+        return [{"class": "engine-drift", "detail": f"engine surface changed: {exc}"}]
+    return [
+        {
+            "class": "absolute-path-literal",
+            "detail": f"line {h.line} [{h.rule}]: {h.matched} (plan bodies are immutable once landed; "
+            "cite a repo-relative path or `machine-local get repos.<key>`, or add `abs-path-ok: <reason>` on that line)",
+        }
+        for h in hits
+    ]
+
+
+def _extra_findings(path: Path, text: str) -> list:
+    """Structural rows for the micro-chunk, depends-on-plan-status, contributed-signal, research-layout
+    and absolute-path classes. Terminal (already-ran) plans owe nothing and yield none."""
+    _ensure_engine_on_path()
+    from coordinator_core.roadmap import prep_gate
+
+    root = _repo_root_of(path) or path.resolve().parent
+    try:
+        if prep_gate.gate_plan(root, path.resolve(), text=text).get("terminal"):
+            return []
+        fm = prep_gate.plan_frontmatter(text)
+        raw_rows = prep_gate.raw_spine_rows(text)
+        found = micro_chunk_findings(raw_rows)
+        found.extend(contributed_signal_findings(fm, raw_rows, root))
+        found.extend(research_layout_findings(raw_rows, root))
+        found.extend(depends_on_plan_status_findings(text, raw_rows, root, prep_gate))
+        found.extend(abs_path_findings(text))
+    except Exception as exc:  # noqa: BLE001 - an engine fault is reported, never a crash
+        return [
+            {
+                "row": "-",
+                "error": f"PREP-GATE-ENGINE-ERROR: {type(exc).__name__}: {exc}"[:300],
+                "at": "extra_classes",
+                "class": "advisory",
+            }
+        ]
+    return [
+        {"row": "-", "error": f"{f['class']}: {_trim(f['detail'])}", "at": f["class"], "class": "structural"}
+        for f in found
+    ]
+
+
+def _check_spine(path: Path, text: str, for_execution: bool) -> dict:
+    result, LocateStatus = _locate_spine(text)
+    if result.status is LocateStatus.ABSENT:
+        return {"path": str(path), "verdict": "NO-SPINE", "detail": None, "rows": []}
+    if result.status is LocateStatus.MALFORMED:
+        return {
+            "path": str(path),
+            "verdict": "MALFORMED",
+            "detail": "a `## Tasks` block is present but its fence does not parse",
+            "rows": [],
+        }
+
+    import yaml
+
+    try:
+        rows = yaml.safe_load(result.body)
+    except yaml.YAMLError as exc:
+        return {"path": str(path), "verdict": "MALFORMED", "detail": f"YAML: {exc}", "rows": []}
+    if not isinstance(rows, list):
+        return {
+            "path": str(path),
+            "verdict": "MALFORMED",
+            "detail": "the plan-tasks block is not a list of task rows",
+            "rows": [],
+        }
+
+    import jsonschema
+
+    schema = json.loads(_schema_path().read_text(encoding="utf-8"))
+    validator = jsonschema.Draft202012Validator(schema)
+    findings = []
+    for index, row in enumerate(rows):
+        row_id = (row or {}).get("id") if isinstance(row, dict) else None
+        label = row_id or f"row {index + 1} (no id)"
+        if not isinstance(row, dict):
+            findings.append({"row": label, "error": "not a mapping", "at": ""})
+            continue
+        for error in sorted(validator.iter_errors(row), key=lambda e: list(e.path)):
+            at = "/".join(str(part) for part in error.path)
+            findings.append(
+                {
+                    "row": label,
+                    "error": _trim(_message_for(error)),
+                    "at": at,
+                    "class": "legacy" if _is_legacy(at, error.message) else "structural",
+                }
+            )
+    advisories = []
+    written_paths = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for p in (row.get("writes") or []):
+            if isinstance(p, str):
+                written_paths.add(_norm_path(p))
+        for p in (row.get("writes_under") or []):
+            if isinstance(p, str):
+                written_paths.add(_norm_path(p))
+
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        row_id = row.get("id")
+        label = row_id or f"row {index + 1} (no id)"
+
+        if row.get("reads"):
+            advisories.append(
+                {
+                    "row": label,
+                    "error": "LEGACY-READS: split into `reads_at_head`/`consumes` when next touched",
+                    "at": "reads",
+                    "class": "advisory",
+                }
+            )
+        _ensure_engine_on_path()
+        from coordinator_core.ops.dispatch_emit.spine_read import contradictory_read_paths
+
+        both = contradictory_read_paths(
+            [*(row.get("reads") or []), *(row.get("consumes") or [])],
+            row.get("reads_at_head") or [],
+        )
+        if both:
+            findings.append(
+                {
+                    "row": label,
+                    "error": (
+                        f"CONTRADICTORY-READS {both!r} in both `reads_at_head` and "
+                        "`consumes`/`reads` — dispatch.emit refuses; keep one"
+                    ),
+                    "at": "reads_at_head",
+                    "class": "structural",
+                }
+            )
+        for p in (row.get("reads_at_head") or []):
+            if isinstance(p, str) and _norm_path(p) in written_paths:
+                advisories.append(
+                    {
+                        "row": label,
+                        "error": (
+                            f"reads_at_head `{p}` — you read HEAD, not another row's output — "
+                            "declare `consumes` if you need it"
+                        ),
+                        "at": "reads_at_head",
+                        "class": "advisory",
+                    }
+                )
+        for p in (row.get("consumes") or []):
+            if not isinstance(p, str):
+                continue
+            if _norm_path(p) not in written_paths:
+                advisories.append(
+                    {
+                        "row": label,
+                        "error": f"consumes `{p}` — orders nothing — use `reads_at_head`",
+                        "at": "consumes",
+                        "class": "advisory",
+                    }
+                )
+
+        deferred = row.get("deferred") is True
+        execution_mode = row.get("execution_mode", "agent")
+        disposition = row.get("disposition", "open")
+        if (
+            not deferred
+            and disposition == "open"
+            and execution_mode == "agent"
+            and row.get("writes") is None
+            and not row.get("writes_under")
+        ):
+            finding = {
+                "row": label,
+                "error": "UNDECLARED writes — this row has no write target",
+                "at": "writes",
+                "class": "structural" if for_execution else "advisory",
+            }
+            if for_execution:
+                findings.append(finding)
+            else:
+                advisories.append(finding)
+
+    tracked = _tracked_listing(path, rows)
+    advisories.extend(_basename_collisions(rows, tracked))
+    advisories.extend(_gate_created_elsewhere(text, rows, tracked))
+    caller_advisories, caller_structural = _test_caller_findings(path, rows, written_paths)
+    advisories.extend(caller_advisories)
+    findings.extend(caller_structural)
+
+    width, width_unavailable = _compute_width(path)
+    if width is not None:
+        dispatchable_rows = width["dispatchable_rows"]
+        max_width = width["max_width"]
+        if dispatchable_rows >= 3 and max_width < 3 and _width_rationale(text) is None:
+            advisories.append(
+                {
+                    "row": "(plan)",
+                    "error": (
+                        f"WIDTH<3: max width {max_width} over {dispatchable_rows} dispatchable "
+                        "row(s) — add a `## Width rationale` section or restructure "
+                        "interface-first"
+                    ),
+                    "at": "width",
+                    "class": "advisory",
+                }
+            )
+
+    pm_brief = _pm_brief_module()
+    brief_section = pm_brief.extract_brief_section(text)
+    if brief_section is None:
+        no_brief = True
+    else:
+        no_brief = False
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            row_id = row.get("id")
+            label = row_id or f"row {index + 1} (no id)"
+            if row.get("deferred") is True:
+                continue
+            if row.get("disposition", "open") not in ("open", "coded"):
+                continue
+            trace = row.get("traces_to_brief")
+            if not pm_brief.trace_ok(trace, brief_section):
+                findings.append(
+                    {
+                        "row": label,
+                        "error": (
+                            "missing traces_to_brief"
+                            if not trace
+                            else "traces_to_brief must be a string"
+                            if not isinstance(trace, str)
+                            else "traces_to_brief is not a substring of the plan's `## PM brief` section"
+                        ),
+                        "at": "traces_to_brief",
+                        "class": "structural",
+                    }
+                )
+
+    if any(f["class"] == "structural" for f in findings):
+        verdict = "INVALID"
+    elif findings:
+        verdict = "LEGACY"
+    else:
+        verdict = "VALID"
+    return {
+        "path": str(path),
+        "verdict": verdict,
+        "detail": None,
+        "rows": findings,
+        "no_brief": no_brief,
+        "advisories": advisories,
+        "width": width,
+        "width_unavailable": width_unavailable,
+    }
+
+
+def _render(report: dict) -> str:
+    name = Path(report["path"]).name
+    no_brief_line = "\n  NO-BRIEF (no `## PM brief` section; trace check not applicable)" if (
+        report.get("no_brief") is True
+    ) else ""
+    advisory_lines = [
+        f"  {a['row']} at `{a['at']}`: {a['error']}  [advisory, not fatal]"
+        for a in report.get("advisories", [])
+    ]
+    width = report.get("width")
+    if width is not None:
+        width_line = (
+            f"  WIDTH max={width['max_width']} "
+            f"critical-path={width['critical_path_rows']}/{width['dispatchable_rows']} "
+            f"share={width['critical_path_share']:.2f}"
+        )
+        advisory_lines = [width_line] + advisory_lines
+    elif report.get("width_unavailable"):
+        advisory_lines = [f"  WIDTH unavailable: {report['width_unavailable']}"] + advisory_lines
+    advisory_block = ("\n" + "\n".join(advisory_lines)) if advisory_lines else ""
+    if report["verdict"] in ("VALID", "NO-SPINE"):
+        return f"plan-spine-check: {report['verdict']} — {name}{no_brief_line}{advisory_block}"
+    if report["verdict"] == "LEGACY":
+        return (
+            f"plan-spine-check: LEGACY — {name} ({len(report['rows'])} tolerated finding(s), "
+            f"no structural defect){no_brief_line}{advisory_block}"
+        )
+    lines = [f"plan-spine-check: {report['verdict']} — {name}"]
+    if report["detail"]:
+        lines.append(f"  {report['detail']}")
+    for finding in report["rows"]:
+        at = f" at `{finding['at']}`" if finding["at"] else ""
+        tag = "" if finding["class"] == "structural" else "  [legacy, not fatal]"
+        lines.append(f"  {finding['row']}{at}: {finding['error']}{tag}")
+    if no_brief_line:
+        lines.append(no_brief_line.strip())
+    if advisory_lines:
+        lines.extend(advisory_lines)
+    return "\n".join(lines)
+
+
+def main(argv: "list[str] | None" = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="plan-spine-check",
+        description="Validate a plan's `## Tasks` spine against plan-tasks.schema.json. Writes nothing.",
+    )
+    parser.add_argument("plans", nargs="+", help="plan file(s)")
+    parser.add_argument("--json", action="store_true", help="emit the full report as JSON")
+    parser.add_argument(
+        "--for-execution",
+        action="store_true",
+        help="mark the plan execution-bound: UNDECLARED writes becomes STRUCTURAL (exit 1)",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        reports = [check_plan(Path(p), for_execution=args.for_execution) for p in args.plans]
+    except CheckError as exc:
+        print(f"plan-spine-check: {exc}", file=sys.stderr)
+        return EXIT_UNREADABLE
+
+    if args.json:
+        print(json.dumps({"reports": reports}, indent=2))
+    else:
+        for report in reports:
+            print(_render(report))
+
+    if any(r["verdict"] == "UNREADABLE" for r in reports):
+        return EXIT_UNREADABLE
+    if any(r["verdict"] in ("INVALID", "MALFORMED") for r in reports):
+        return EXIT_INVALID
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

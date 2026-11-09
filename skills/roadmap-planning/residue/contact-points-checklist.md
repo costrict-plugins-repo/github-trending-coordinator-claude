@@ -1,0 +1,5 @@
+- **`/handoff` and `/spinoff`:** gate text is subsystem-named, never file-pathed (the schema rejects a path-shaped `gate_dependency`): baton dependency → `blocked_by` slug, prose → `gate_notes`.
+- **`/repo-setup`**, **`/workstream-start`**, **`/workstream-complete`**: orientation, the `deployment_state=ready_to_fire` query callout and plan-doc update cover `kind: roadmap-baton`.
+- **`/workday-start`** — Step 1.1 groups `kind: roadmap-baton` with spinoffs, clustered by `roadmap_id` when >3 per group.
+- **Hooks:** `session.boot_sweep` archives consumed handoffs whose session is dead, covering orphaned roadmap stubs.
+- **Discovery:** `bin/query-records --list-schemas`, `bin/lint-frontmatter --list-schemas`.

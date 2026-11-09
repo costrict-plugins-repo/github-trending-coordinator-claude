@@ -1,0 +1,326 @@
+"""Run a test command and refuse to report its result unless the corpus held still.
+
+Ported from coordinator-content-repo `coordinator/bin/stable-suite-run.py` (W3-C1,
+`docs/plans/2026-09-18-doe-holds-no-scripts.md`) -- mechanical move, no behavioural change. No
+path resolution at all (§ Path resolution): every git call below is run with the default cwd
+(the caller's), and nothing here touches `__file__`.
+
+Invoked as `python coordinator/bin/stable-suite-run.py -- <cmd>`; carries no interpreter shebang on
+purpose. An env-style shebang line is itself the POSIX-exec assumption this repo's own posix-exec
+ratchet flags -- it caught this file on its first run, which is the gate working. The literal form
+is deliberately not spelled out here: the ratchet matches on text, so writing the example out would
+re-trip the very gate this paragraph is about.
+
+Purpose: on a shared worktree several live sessions commit into, a suite result is not
+trustworthy on its own. Measured 2026-08-07 on this repo: ~14 peer commits landed per 10
+minutes against a ~60s suite, and three consecutive full runs produced three DIFFERENT
+failure sets while every failing test passed in isolation. The tests that flicker are the
+corpus-scanning ones -- ratchets, template/symbol parity, and "the live repo was not
+mutated" liveness checks -- because the thing they scan changed mid-run.
+
+So a bare red is not evidence of a defect here, and a bare green is not evidence of health:
+both partly measure the peer commit rate. This wrapper brackets the run with HEAD and with
+the tracked-file dirty set, and reports UNSTABLE (exit 2) when either moved, distinct from
+PASS (0) and FAIL (1). An UNSTABLE result is not a failure of the code -- it means the
+measurement did not happen and must be retaken.
+
+Negative-spec -- what this deliberately does NOT do:
+  - It does not create a git worktree or a clone. Parallel agents share one tree here by
+    doctrine; this only observes, never checks anything out.
+  - It does not quiesce peers, retry forever, or serialize anyone. It reports honestly and
+    lets the caller decide.
+  - It does not interpret the test output. Pass/fail is the runner's verdict, untouched.
+
+Spec backlink: docs/plans/2026-08-07-windows-clean-the-coordinator-tests-suite.md AC7, and
+state/audits/2026-08-07-windows-clean-execution-record.md (the measurement-hazard section).
+"""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+
+import os  # noqa: E402
+
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+# Bounds the triage re-run and each solo rerun this file spawns itself; the command under
+# measurement in `main()` is the caller's and is deliberately unbounded.
+_TRIAGE_TIMEOUT_S = 600
+
+
+def _fd_or_none(stream):
+    """The stream's OS fd, or None (inherit) for a fileno-less stream."""
+    try:
+        return stream.fileno()
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+EXIT_PASS = 0
+EXIT_FAIL = 1
+EXIT_UNSTABLE = 2
+
+
+def _git(*args: str) -> str | None:
+    from coordinator_core.ops.ceremony.git_native import _git as _git_native
+
+    result = _git_native(list(args), cwd=".")
+    if not result.ok:
+        return None
+    return result.stdout.strip()
+
+
+def _corpus_fingerprint() -> tuple[str | None, str | None]:
+    """(HEAD sha, tracked-file dirty set). Both must hold still across the run.
+
+    HEAD alone is insufficient: a peer editing a tracked file without committing moves the
+    corpus just as effectively. Untracked paths are excluded on purpose -- scratch output
+    from the run itself would otherwise self-report as instability.
+
+    Either element being None means "could not fingerprint," never "empty." The caller
+    must treat that as UNSTABLE, not as a trivially-equal pair of successful reads.
+
+    One
+    `git status --porcelain=v2 --branch --untracked-files=no` call returns both
+    the HEAD oid (the `# branch.oid` header line) and the tracked-file dirty set
+    (the entry lines) in a single spawn, replacing the prior `rev-parse` +
+    `diff --name-only` pair. Untracked paths are excluded via
+    `--untracked-files=no`, preserving the original's scratch-output exclusion.
+    """
+    raw = _git("--no-optional-locks", "status", "--porcelain=v2", "--branch", "--untracked-files=no")
+    if raw is None:
+        return None, None
+    head_sha: str | None = None
+    dirty_lines: list[str] = []
+    for line in raw.splitlines():
+        if line.startswith("# branch.oid "):
+            head_sha = line[len("# branch.oid ") :].strip()
+        elif line and not line.startswith("#"):
+            dirty_lines.append(line)
+    if head_sha is None or head_sha == "(initial)":
+        return None, None
+    return head_sha, "\n".join(dirty_lines)
+
+
+def _failing_node_ids(command: list[str]) -> list[str]:
+    try:
+        proc = subprocess.run(
+            [*command, "-p", "no:randomly"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_TRIAGE_TIMEOUT_S,
+            creationflags=_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(
+            f"stable-suite-run: triage re-run could not complete ({exc}); "
+            "no parseable FAILED node ids.",
+            file=sys.stderr,
+        )
+        return []
+    lines = (proc.stdout + proc.stderr).splitlines()
+    summary_start = None
+    for idx, line in enumerate(lines):
+        if "short test summary info" in line:
+            summary_start = idx + 1
+            break
+
+    scan_lines = lines[summary_start:] if summary_start is not None else lines
+    ids: list[str] = []
+    for line in scan_lines:
+        stripped = line.strip()
+        if not stripped.startswith("FAILED "):
+            continue
+        rest = stripped[len("FAILED ") :]
+        node = rest.rsplit(" - ", 1)[0].strip()
+        if "::" in node:
+            ids.append(node)
+    return ids
+
+
+def _pytest_base(command: list[str]) -> list[str]:
+    stripped: list[str] = []
+    kept: list[str] = []
+    skip_next = False
+    for tok in command:
+        if skip_next:
+            stripped.append(tok)
+            skip_next = False
+            continue
+        if tok == "-k":
+            stripped.append(tok)
+            skip_next = True
+            continue
+        normalized = tok.replace("\\", "/")
+        if "coordinator/tests" in normalized:
+            stripped.append(tok)
+            continue
+        kept.append(tok)
+
+    if not stripped:
+        print(
+            "stable-suite-run: WARNING — could not identify a test-path/selector arg to "
+            f"strip from {command!r}; falling back to a bare `python -m pytest`, which may "
+            "not match the caller's actual runner or venv.",
+            file=sys.stderr,
+        )
+        return ["python", "-m", "pytest"]
+    return kept
+
+
+def _triage_isolation(command: list[str]) -> None:
+    fp_before = _corpus_fingerprint()
+    node_ids = _failing_node_ids(command)
+    fp_after = _corpus_fingerprint()
+    if None in (*fp_before, *fp_after) or fp_before != fp_after:
+        print(
+            "stable-suite-run: WARNING — the corpus moved (or could not be fingerprinted) "
+            "during the triage re-run; the GENUINE/ORDER-DEPENDENT breakdown below is "
+            "computed against a possibly-different corpus than the run just certified "
+            "stable, and carries no stability guarantee of its own.",
+            file=sys.stderr,
+        )
+
+    if not node_ids:
+        print(
+            "stable-suite-run: triage found no parseable FAILED node ids — "
+            "is the command a pytest invocation?",
+            file=sys.stderr,
+        )
+        return
+
+    base = _pytest_base(command)
+    genuine: list[str] = []
+    order_dependent: list[str] = []
+    for node in node_ids:
+        try:
+            solo = subprocess.run(
+                [*base, node, "-q", "--no-header"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=_TRIAGE_TIMEOUT_S,
+                creationflags=_NO_WINDOW,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            # A stall or crash is not evidence the failure is merely order-dependent.
+            print(
+                f"stable-suite-run: solo rerun of {node} could not complete ({exc}); "
+                "counting it as GENUINE.",
+                file=sys.stderr,
+            )
+            genuine.append(node)
+            continue
+        (genuine if solo.returncode != 0 else order_dependent).append(node)
+
+    print(
+        f"\nstable-suite-run: isolation triage of {len(node_ids)} failure(s) —\n"
+        f"  GENUINE ({len(genuine)}): fail alone too. These are real defects.\n"
+        f"  ORDER-DEPENDENT ({len(order_dependent)}): pass alone. The defect is in the coupling "
+        f"between tests (shared markers, registries, cwd), not in the test's own subject — a "
+        f"different bug, not a non-bug.",
+        file=sys.stderr,
+    )
+    for node in genuine:
+        print(f"    GENUINE          {node}", file=sys.stderr)
+    for node in order_dependent:
+        print(f"    ORDER-DEPENDENT  {node}", file=sys.stderr)
+
+
+def main(argv: list[str] | None = None) -> int:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+    from cc_invoke import ensure_engine_on_path
+
+    ensure_engine_on_path(__file__)
+    parser = argparse.ArgumentParser(
+        description="Run a command and flag whether the repo corpus moved underneath it.",
+    )
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        default=1,
+        help="Retake the measurement up to N times, stopping at the first stable one.",
+    )
+    parser.add_argument(
+        "--triage-isolation",
+        action="store_true",
+        help=(
+            "On a stable FAIL, re-run each failing pytest node id ALONE and split the failures "
+            "into genuine (fails both ways) and order-dependent (passes alone). Requires the "
+            "command to be a pytest invocation."
+        ),
+    )
+    parser.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="The command to run, after `--`. Its own exit code is passed through when stable.",
+    )
+    args = parser.parse_args(argv)
+
+    command = [c for c in args.command if c != "--"]
+    if not command:
+        parser.error("no command given; pass it after `--`")
+
+    for attempt in range(1, max(1, args.attempts) + 1):
+        head_before, dirty_before = _corpus_fingerprint()
+        # Real fds handed over: CREATE_NO_WINDOW with no stream kwarg sends the
+        # suite's output into an unreadable console on Windows.
+        completed = subprocess.run(
+            command,
+            check=False,
+            creationflags=_NO_WINDOW,
+            stdout=_fd_or_none(sys.stdout),
+            stderr=_fd_or_none(sys.stderr),
+        )
+        head_after, dirty_after = _corpus_fingerprint()
+
+        # A None on either side means git
+        # could not be queried at all, which is NOT the same as "held still." Treat it as
+        # UNSTABLE (a distinct reason, not folded into the moved-HEAD/moved-files cases
+        # below) rather than letting None == None report a false PASS/FAIL.
+        if None in (head_before, dirty_before, head_after, dirty_after):
+            print(
+                "\nstable-suite-run: UNSTABLE — git could not be queried (not on PATH, not "
+                f"a repo, or a failing git call), attempt {attempt} of {args.attempts}. The "
+                f"runner reported exit {completed.returncode}, but this tool has no evidence "
+                "the corpus held still, so that number means nothing.",
+                file=sys.stderr,
+            )
+            continue
+
+        stable = head_before == head_after and dirty_before == dirty_after
+        if stable:
+            verdict = "PASS" if completed.returncode == 0 else "FAIL"
+            print(
+                f"\nstable-suite-run: {verdict} — corpus held still at {head_before[:9]} "
+                f"for the whole run (attempt {attempt}).",
+                file=sys.stderr,
+            )
+            if completed.returncode != 0 and args.triage_isolation:
+                _triage_isolation(command)
+            return EXIT_PASS if completed.returncode == 0 else EXIT_FAIL
+
+        moved = "HEAD" if head_before != head_after else "tracked-file edits"
+        print(
+            f"\nstable-suite-run: UNSTABLE — {moved} changed during the run "
+            f"({head_before[:9]} -> {head_after[:9]}), attempt {attempt} of {args.attempts}. "
+            f"The runner reported exit {completed.returncode}, but the corpus it measured is "
+            f"not the corpus on disk, so that number means nothing.",
+            file=sys.stderr,
+        )
+
+    print(
+        "stable-suite-run: no stable measurement obtained. Retake it when the tree is quieter, "
+        "or reconcile with the sessions committing into it — do NOT read the last exit code as a "
+        "verdict.",
+        file=sys.stderr,
+    )
+    return EXIT_UNSTABLE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
