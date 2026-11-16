@@ -1,0 +1,27 @@
+---
+provenance:
+  - distilled: 2026-11-13
+    run_id: 2026-11-13-11h40
+    omitted_reasons:
+      archived_spec: private-source
+---
+
+# `workweek-complete.md` — Section Provenance
+
+Holds the per-section spec-backlink history for `workweek-complete.md`, kept off the command surface so the ceremony reads evergreen.
+
+> Purpose: the spec-backlink history for `coordinator/commands/workweek-complete.md`, relocated
+> off the command surface itself so the ceremony reads evergreen (axis-2: a command file
+> narrates the ceremony, not its own authorship history). One row per section that carries
+> its `<!-- spec-backlink: ... -->` provenance here instead of inline. If a cited plan/memo has since archived, check
+> `archive/` before treating the pointer as dead — spec backlinks outlive their spec.
+>
+> The backlink table itself is fleet-internal: it lives in the doctrine repo's source tree and does
+> not ship, so its absence from an installed or mirrored tree is expected, not a missing section.
+
+
+
+## Cadence split origin
+
+<!-- PROVENANCE: run 2026-11-13-11h40, derived from batch-1-063 -->
+The workday/workweek split (2026-05-04) lightened `/workday-complete` and added `/workweek-start` and `/workweek-complete`. The load-bearing rule: **handoffs are the atom, the changelog is the index.** Daily files are per machine, `tasks/week-changelog/YYYY-MM-DD-{hostname}.md`, which avoids concurrent-write conflicts.

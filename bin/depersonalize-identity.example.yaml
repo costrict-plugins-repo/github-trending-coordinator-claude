@@ -1,0 +1,9 @@
+
+
+# target/composed section — this file is a per-operator DATA TEMPLATE, not
+
+
+# List entries LONGEST-KEY-FIRST so a key that is a substring of another is
+
+
+entries: []

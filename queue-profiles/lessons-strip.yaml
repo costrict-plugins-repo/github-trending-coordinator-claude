@@ -1,0 +1,98 @@
+
+
+row_id_key: "@stem"
+
+batch_key: [promoted_to]
+
+priority:
+  field: created
+  order: asc
+
+verdicts:
+  - promoted
+  - drifted
+  - not-applied
+
+
+hand_back_types:
+  - strip-drift
+  - strip-pending
+
+graph:
+  triage:
+    kind: triage
+    edges:
+      promoted: refute-close
+      drifted: strip-drift
+      not-applied: strip-pending
+    on_fail: needs-judgment
+
+  refute-close:
+    kind: refute-close
+    edges:
+      confirmed: commit
+    
+    
+    on_fail: needs-judgment
+
+  commit:
+    kind: commit
+    edges: {}
+    on_fail: commit-failed
+
+closure:
+  status_field: status
+  closed_values:
+    refute-close: applied
+  stamp_fields: [closed_at, closed_by]
+
+triage_policy: |
+  A row closes only when its promoted_to outbox record sits in DoE's
+  state/lessons-outbox/drained/ with a closing commit, and the row's body
+  still matches the promoted body.
+
+  promoted:
+    - "promoted: the promoted_to outbox record has settled (drained, with a closing commit) and the row's body still matches what was promoted. refute-close checks both by reading DoE; it writes nothing there."
+
+  drifted:
+    - "drifted: the row's body has changed since promotion. Hands back strip-drift naming the divergence -- never silently re-promoted or force-closed."
+
+  not_applied:
+    - "not-applied: the promoted_to outbox record has not yet settled (not drained, or drained without a closing commit). Hands back strip-pending -- the age-sweep backstop retries later."
+
+  never_fabricate_a_routing_id:
+    - "Every record cites a manifest row id."
+
+  every_row_ends_in_exactly_one_verdict: true
+
+appetite:
+  hunt:
+    where: [[["promoted_to", "present"]]]
+    concurrency: 4
+    extra_verification: true
+    batch_size: {default: 4}
+    triage_depth: standard
+    window: 1
+    max_agent_calls: 20
+
+  standard:
+    where: [[["promoted_to", "present"]]]
+    concurrency: 6
+    extra_verification: false
+    batch_size: {default: 4}
+    triage_depth: standard
+    window: 2
+    max_agent_calls: 40
+
+  sweep:
+    where: [[["promoted_to", "present"]]]
+    concurrency: 8
+    extra_verification: true
+    batch_size: {default: 4}
+    triage_depth: shallow
+    window: 4
+    max_agent_calls: 200
+
+archive_path: "archive/lessons/"
+
+schema: lesson-entry.schema.json

@@ -1,0 +1,187 @@
+
+
+row_id_key: "@stem"
+
+
+batch_key: [change_kind]
+
+
+priority:
+  field: created
+  order: asc
+
+verdicts:
+  - stale
+  - fix
+  - structural
+  - needs-judgment
+  - universal
+  - park
+  - wont-do
+  - yagni
+  - unclear-direction
+
+
+hand_back_types:
+  - park
+  - wont-do
+  - yagni
+  - unclear-direction
+  - route-to-learn-lessons
+
+graph:
+  triage:
+    kind: triage
+    edges:
+      stale: refute-close
+      fix: fix
+      structural: baton
+      universal: route-to-learn-lessons
+      needs-judgment: needs-judgment
+      park: park
+      wont-do: wont-do
+      yagni: yagni
+      unclear-direction: unclear-direction
+    
+    
+    on_fail: needs-judgment
+
+  refute-close:
+    kind: refute-close
+    edges:
+      confirmed: commit
+    
+    
+    on_fail: needs-judgment
+
+  fix:
+    kind: fix
+    edges:
+      done: verify
+    on_fail: baton
+
+  verify:
+    kind: verify
+    edges:
+      pass: commit
+    
+    
+    on_fail: verify-failed
+    verify:
+      default: agent
+
+  commit:
+    kind: commit
+    edges: {}
+    on_fail: commit-failed
+
+closure:
+  status_field: status
+  closed_values:
+    fix: closed
+    refute-close: closed
+  stamp_fields: [closed_at, closed_by]
+
+
+triage_policy: |
+    
+    
+    scope:
+      - 'Apply the routing key test: "if a different project type used the coordinator pipeline, would this rule apply?" A yes is universal. A no goes to terminal triage.'
+      - "queue_scope is evidence, never the answer. An unset scope is a decision triage makes."
+
+    
+    class_3_fix:
+      - "fix applies only when the fix is tradeoff-free (no judgment call embedded) AND non-structural (touches no module boundary, interface or cross-system surface)."
+      - "A row that fails only the structural leg is structural, not fix."
+      - "A row with an embedded tradeoff is needs-judgment, not fix."
+
+    presumed_plan_weight:
+      - "A row proposing a new capability, rather than correcting existing behaviour, is a feature request. Size it M or larger unless the digging shows otherwise, with evidence either way."
+
+    stale:
+      - "stale applies when the cited problem no longer reproduces at HEAD, or the row is already applied. refute-close must confirm it before commit."
+
+    park:
+      - "park needs a named reason. It is never a sink for a row triage could not finish -- that row is unclear-direction."
+
+    queue_termini:
+      - "classes 1 and 2 -> baton (solo or themed is decided after the run, by clustering)"
+      - "class 3 -> fix"
+      - "class 4 -> stale in-run, or wont-do / park to the PM"
+      - "Every row ends in exactly one verdict, with no fallthrough."
+
+    
+    verify_map:
+      wiki-append:
+        - agent
+        - coordinator/tests/test_doctrine_surface_split.py
+        - coordinator/tests/test_doctrine_surface_split_index_matches_corpus.py
+        - coordinator/tests/test_doctrine_surfaces_are_not_changelogs.py
+        - coordinator/tests/test_doctrine_surface_weight.py
+      wiki-new:
+        - agent
+        - coordinator/tests/test_doctrine_surface_split.py
+        - coordinator/tests/test_doctrine_surface_split_index_matches_corpus.py
+        - coordinator/tests/test_doctrine_surfaces_are_not_changelogs.py
+        - coordinator/tests/test_doctrine_surface_weight.py
+      skill-edit:
+        - agent
+        - "the tests triage names for the row"
+      script-edit:
+        - agent
+        - "the tests triage names for the row"
+      hook-edit:
+        - agent
+        - "the tests triage names for the row"
+      code-edit:
+        - agent
+        - "the tests triage names for the row"
+      agent-prompt-edit:
+        - agent
+        - "the tests triage names for the row"
+      test-edit:
+        - agent
+        - "the tests triage names for the row"
+      config-edit:
+        - agent
+        - "the tests triage names for the row"
+      
+      default:
+        - agent
+
+appetite:
+  
+  
+  hunt:
+    where: [[["queue_scope", "==", "project"], ["severity", "present"]]]
+    concurrency: 4
+    extra_verification: true
+    batch_size: {default: 4}
+    triage_depth: {default: standard}
+    window: 1
+    max_agent_calls: 20
+
+  
+  standard:
+    where: [[["queue_scope", "==", "project"]], [["queue_scope", "absent"]], [["severity", "present"]]]
+    limit: 150
+    concurrency: 8
+    extra_verification: false
+    batch_size: {default: 4}
+    triage_depth: {default: standard}
+    window: 2
+    max_agent_calls: 40
+
+  
+  sweep:
+    concurrency: 16
+    extra_verification: true
+    batch_size: {P0: 2, P1: 6, P2: 10, P3: 12}
+    triage_depth: {P0: deep, P1: standard, P2: standard, P3: shallow}
+    window: 4
+    max_agent_calls: 200
+
+archive_path: "archive/improvement-queue/"
+
+schema: improvement-queue.schema.json
